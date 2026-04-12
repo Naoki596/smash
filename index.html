@@ -1,0 +1,2761 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>スマッシュファイターズ</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+  background: #000;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  height: 100vh;
+  overflow: hidden;
+  font-family: 'Arial', sans-serif;
+}
+canvas {
+  display: block;
+  image-rendering: pixelated;
+}
+</style>
+</head>
+<body>
+<canvas id="gameCanvas"></canvas>
+<script>
+// ============================================================
+// スマッシュファイターズ - Super Smash Bros Style Game
+// ============================================================
+
+const canvas = document.getElementById('gameCanvas');
+const ctx = canvas.getContext('2d');
+
+// --- Canvas Setup ---
+const BASE_W = 1024;
+const BASE_H = 640;
+canvas.width = BASE_W;
+canvas.height = BASE_H;
+
+function resizeCanvas() {
+  const scaleX = window.innerWidth / BASE_W;
+  const scaleY = window.innerHeight / BASE_H;
+  const scale = Math.min(scaleX, scaleY);
+  canvas.style.width = (BASE_W * scale) + 'px';
+  canvas.style.height = (BASE_H * scale) + 'px';
+}
+resizeCanvas();
+window.addEventListener('resize', resizeCanvas);
+
+// ============================================================
+// Constants
+// ============================================================
+const GRAVITY = 0.55;
+const MAX_FALL_SPEED = 12;
+const FAST_FALL_SPEED = 15;
+const FRICTION = 0.6;
+const AIR_FRICTION = 0.95;
+const BLAST_ZONE = { top: -200, bottom: BASE_H + 200, left: -250, right: BASE_W + 250 };
+const DEFAULT_STOCKS = 3;
+const RESPAWN_INVINCIBILITY = 120;
+const HITSTUN_MULTIPLIER = 0.4;
+const DI_STRENGTH = 0.08;
+
+// ============================================================
+// Player-adjustable settings
+// ============================================================
+const SETTINGS = {
+  speedScale: 1.0,    // 移動速度倍率
+  stocks: 3,          // ストック数 1〜5
+  items: true,        // アイテム ON/OFF
+};
+const SPEED_PRESETS = [
+  { label: 'とてもおそい', value: 0.5 },
+  { label: 'おそい',       value: 0.7 },
+  { label: 'ふつう',       value: 1.0 },
+  { label: '速い',         value: 1.3 },
+  { label: 'とても速い',   value: 1.6 },
+  { label: 'MAX',          value: 2.0 },
+];
+
+// ============================================================
+// Game States
+// ============================================================
+const STATE = {
+  TITLE: 'title',
+  CHAR_SELECT: 'charSelect',
+  DIFF_SELECT: 'diffSelect',
+  STAGE_SELECT: 'stageSelect',
+  COUNTDOWN: 'countdown',
+  FIGHTING: 'fighting',
+  PAUSED: 'paused',
+  VICTORY: 'victory'
+};
+
+// ============================================================
+// Input Manager
+// ============================================================
+class InputManager {
+  constructor() {
+    this.keys = {};
+    this.prevKeys = {};
+    window.addEventListener('keydown', e => {
+      e.preventDefault();
+      this.keys[e.code] = true;
+    });
+    window.addEventListener('keyup', e => {
+      e.preventDefault();
+      this.keys[e.code] = false;
+    });
+  }
+  isDown(code) { return !!this.keys[code]; }
+  justPressed(code) { return !!this.keys[code] && !this.prevKeys[code]; }
+  update() { this.prevKeys = { ...this.keys }; }
+}
+
+// ============================================================
+// Particle System
+// ============================================================
+class Particle {
+  constructor(x, y, vx, vy, color, life, size) {
+    this.x = x; this.y = y; this.vx = vx; this.vy = vy;
+    this.color = color; this.life = life; this.maxLife = life;
+    this.size = size || 4;
+  }
+  update() {
+    this.x += this.vx; this.y += this.vy;
+    this.vy += 0.1;
+    this.life--;
+  }
+  draw(ctx) {
+    const alpha = this.life / this.maxLife;
+    ctx.globalAlpha = alpha;
+    ctx.fillStyle = this.color;
+    ctx.fillRect(this.x - this.size/2, this.y - this.size/2, this.size * alpha, this.size * alpha);
+    ctx.globalAlpha = 1;
+  }
+}
+
+// ============================================================
+// Finish Blow Effect State
+// ============================================================
+let finishEffect = null; // { timer, maxTimer, x, y, angle, color, targetFighter }
+
+function triggerFinishEffect(x, y, angle, color, fighter) {
+  finishEffect = { timer: 25, maxTimer: 25, x, y, angle, color, targetFighter: fighter };
+  playFinishSound();
+}
+
+function playFinishSound() {
+  playSound(150, 'sawtooth', 0.2, 0.2);
+  playSound(600, 'sine', 0.3, 0.15);
+}
+
+// KO blast effect at screen edge
+let koBlast = null; // { timer, x, y, side }
+
+function triggerKOBlast(x, y, side) {
+  koBlast = { timer: 40, x, y, side };
+  playSound(80, 'sawtooth', 0.3, 0.2);
+}
+
+const particles = [];
+const MAX_PARTICLES = 200;
+
+function addParticle(p) {
+  if (particles.length < MAX_PARTICLES) particles.push(p);
+}
+function spawnHitParticles(x, y, count, color) {
+  count = Math.min(count, 15); // Cap per-spawn
+  for (let i = 0; i < count; i++) {
+    const angle = Math.random() * Math.PI * 2;
+    const speed = 2 + Math.random() * 5;
+    addParticle(new Particle(
+      x, y, Math.cos(angle) * speed, Math.sin(angle) * speed,
+      color, 15 + Math.random() * 15, 3 + Math.random() * 5
+    ));
+  }
+}
+function spawnExplosion(x, y) {
+  const colors = ['#ff4400', '#ffaa00', '#ffff00', '#ffffff'];
+  for (let i = 0; i < 20; i++) {
+    const angle = Math.random() * Math.PI * 2;
+    const speed = 3 + Math.random() * 8;
+    addParticle(new Particle(
+      x, y, Math.cos(angle) * speed, Math.sin(angle) * speed,
+      colors[Math.floor(Math.random() * colors.length)], 20 + Math.random() * 20, 4 + Math.random() * 8
+    ));
+  }
+}
+
+// ============================================================
+// Screen Shake
+// ============================================================
+let shakeX = 0, shakeY = 0, shakeMagnitude = 0, shakeDuration = 0;
+function triggerShake(mag, dur) { shakeMagnitude = mag; shakeDuration = dur; }
+function updateShake() {
+  if (shakeDuration > 0) {
+    shakeX = (Math.random() - 0.5) * shakeMagnitude * 2;
+    shakeY = (Math.random() - 0.5) * shakeMagnitude * 2;
+    shakeDuration--;
+    shakeMagnitude *= 0.9;
+  } else { shakeX = 0; shakeY = 0; }
+}
+
+// ============================================================
+// Sound System (Web Audio API) - with node cleanup
+// ============================================================
+let audioCtx;
+let activeSounds = 0;
+const MAX_SOUNDS = 16; // Prevent audio node leak
+function ensureAudio() {
+  if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+}
+function playSound(freq, type, duration, volume) {
+  ensureAudio();
+  if (activeSounds >= MAX_SOUNDS) return; // Skip if too many active
+  activeSounds++;
+  const osc = audioCtx.createOscillator();
+  const gain = audioCtx.createGain();
+  osc.type = type || 'square';
+  osc.frequency.value = freq;
+  gain.gain.value = volume || 0.1;
+  gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + duration);
+  osc.connect(gain);
+  gain.connect(audioCtx.destination);
+  osc.start();
+  osc.stop(audioCtx.currentTime + duration);
+  // Clean up nodes after they finish
+  osc.onended = () => {
+    osc.disconnect();
+    gain.disconnect();
+    activeSounds--;
+  };
+}
+function playHitSound(strength) {
+  const vol = 0.05 + strength * 0.1;
+  playSound(200 + strength * 100, 'sawtooth', 0.1, Math.min(vol, 0.3));
+}
+function playKOSound() {
+  playSound(600, 'square', 0.1, 0.2);
+  playSound(300, 'square', 0.3, 0.15);
+}
+function playJumpSound() { playSound(500, 'sine', 0.08, 0.05); }
+function playMenuSound() { playSound(800, 'sine', 0.05, 0.08); }
+
+// ============================================================
+// Stages
+// ============================================================
+const STAGES = {
+  battlefield: {
+    name: '戦場',
+    platforms: [
+      { x: 212, y: 450, w: 600, h: 30, type: 'solid' },
+      { x: 362, y: 330, w: 300, h: 15, type: 'passthrough' },
+      { x: 232, y: 260, w: 180, h: 15, type: 'passthrough' },
+      { x: 612, y: 260, w: 180, h: 15, type: 'passthrough' }
+    ],
+    bg: { top: '#1a0a2e', bottom: '#16213e' },
+    spawnPoints: [{ x: 350, y: 450 }, { x: 650, y: 450 }]
+  },
+  finalDest: {
+    name: '終点',
+    platforms: [
+      { x: 212, y: 450, w: 600, h: 30, type: 'solid' }
+    ],
+    bg: { top: '#0a0a2e', bottom: '#000033' },
+    spawnPoints: [{ x: 380, y: 450 }, { x: 620, y: 450 }]
+  },
+  dreamland: {
+    name: 'ドリームランド',
+    platforms: [
+      { x: 162, y: 460, w: 700, h: 30, type: 'solid' },
+      { x: 262, y: 340, w: 150, h: 15, type: 'passthrough' },
+      { x: 437, y: 280, w: 150, h: 15, type: 'passthrough' },
+      { x: 612, y: 340, w: 150, h: 15, type: 'passthrough' }
+    ],
+    bg: { top: '#2e1a4e', bottom: '#4a2080' },
+    spawnPoints: [{ x: 370, y: 460 }, { x: 660, y: 460 }]
+  }
+};
+
+// ============================================================
+// Characters
+// ============================================================
+const CHARACTERS = {
+  brawler: {
+    name: 'ブローラー',
+    color: '#ff4444',
+    outlineColor: '#cc0000',
+    weight: 1.0,
+    walkSpeed: 3.0,
+    runSpeed: 5.5,
+    jumpForce: -11,
+    airJumpForce: -10,
+    size: { w: 36, h: 50 },
+    description: 'バランス型',
+    attacks: {
+      jab:    { damage: 3, baseKB: 2, kbGrowth: 0.08, angle: 0, startup: 2, active: 5, endlag: 6, hx: 0, hy: -15, hw: 50, hh: 40 },
+      ftilt:  { damage: 8, baseKB: 4, kbGrowth: 0.12, angle: -0.3, startup: 5, active: 5, endlag: 12, hx: 0, hy: -20, hw: 55, hh: 45 },
+      smash:  { damage: 18, baseKB: 8, kbGrowth: 0.25, angle: -0.5, startup: 14, active: 5, endlag: 22, hx: 0, hy: -20, hw: 65, hh: 50 },
+      special:{ damage: 12, baseKB: 7, kbGrowth: 0.18, angle: -1.2, startup: 6, active: 6, endlag: 18, hx: -5, hy: -25, hw: 45, hh: 55, isUppercut: true },
+      nair:   { damage: 7, baseKB: 3, kbGrowth: 0.1, angle: -0.6, startup: 3, active: 8, endlag: 10, hx: -20, hy: -15, hw: 70, hh: 55 },
+      fair:   { damage: 10, baseKB: 5, kbGrowth: 0.15, angle: -0.4, startup: 5, active: 5, endlag: 14, hx: 0, hy: -15, hw: 55, hh: 45 },
+      dair:   { damage: 12, baseKB: 6, kbGrowth: 0.2, angle: Math.PI/2 - 0.3, startup: 8, active: 5, endlag: 18, hx: -10, hy: 5, hw: 45, hh: 50, spike: true }
+    }
+  },
+  speedster: {
+    name: 'スピードスター',
+    color: '#4488ff',
+    outlineColor: '#0044cc',
+    weight: 0.8,
+    walkSpeed: 3.8,
+    runSpeed: 7.0,
+    jumpForce: -12,
+    airJumpForce: -10.5,
+    size: { w: 32, h: 46 },
+    description: 'スピード型',
+    attacks: {
+      jab:    { damage: 2, baseKB: 1.5, kbGrowth: 0.06, angle: 0, startup: 2, active: 4, endlag: 4, hx: 0, hy: -12, hw: 45, hh: 35 },
+      ftilt:  { damage: 6, baseKB: 3, kbGrowth: 0.1, angle: -0.3, startup: 3, active: 4, endlag: 8, hx: 0, hy: -18, hw: 52, hh: 40 },
+      smash:  { damage: 14, baseKB: 6, kbGrowth: 0.2, angle: -0.5, startup: 10, active: 4, endlag: 18, hx: 0, hy: -18, hw: 58, hh: 42 },
+      special:{ damage: 2, baseKB: 1, kbGrowth: 0.04, angle: -0.2, startup: 3, active: 14, endlag: 10, hx: 0, hy: -12, hw: 48, hh: 35, multiHit: 5 },
+      nair:   { damage: 6, baseKB: 2.5, kbGrowth: 0.08, angle: -0.5, startup: 2, active: 10, endlag: 6, hx: -18, hy: -12, hw: 65, hh: 50 },
+      fair:   { damage: 8, baseKB: 4, kbGrowth: 0.12, angle: -0.3, startup: 4, active: 4, endlag: 10, hx: 0, hy: -12, hw: 50, hh: 40 },
+      dair:   { damage: 9, baseKB: 5, kbGrowth: 0.15, angle: Math.PI/2 - 0.2, startup: 6, active: 4, endlag: 15, hx: -8, hy: 5, hw: 40, hh: 45, spike: true }
+    }
+  },
+  heavy: {
+    name: 'ヘビー',
+    color: '#44bb44',
+    outlineColor: '#008800',
+    weight: 1.4,
+    walkSpeed: 2.2,
+    runSpeed: 4.0,
+    jumpForce: -9.5,
+    airJumpForce: -8.5,
+    size: { w: 44, h: 54 },
+    description: 'パワー型',
+    attacks: {
+      jab:    { damage: 4, baseKB: 3, kbGrowth: 0.1, angle: 0, startup: 4, active: 5, endlag: 10, hx: 0, hy: -15, hw: 55, hh: 45 },
+      ftilt:  { damage: 12, baseKB: 5, kbGrowth: 0.15, angle: -0.3, startup: 7, active: 6, endlag: 16, hx: 0, hy: -20, hw: 65, hh: 50 },
+      smash:  { damage: 24, baseKB: 10, kbGrowth: 0.32, angle: -0.5, startup: 18, active: 6, endlag: 28, hx: 0, hy: -22, hw: 75, hh: 55 },
+      special:{ damage: 8, baseKB: 3, kbGrowth: 0.1, angle: -0.2, startup: 12, active: 1, endlag: 22, hx: 0, hy: -10, hw: 500, hh: 25, isProjectile: true, projSpeed: 8 },
+      nair:   { damage: 10, baseKB: 4, kbGrowth: 0.12, angle: -0.7, startup: 5, active: 10, endlag: 12, hx: -20, hy: -15, hw: 84, hh: 60 },
+      fair:   { damage: 14, baseKB: 7, kbGrowth: 0.2, angle: -0.4, startup: 10, active: 6, endlag: 20, hx: 0, hy: -15, hw: 65, hh: 50 },
+      dair:   { damage: 16, baseKB: 8, kbGrowth: 0.28, angle: Math.PI/2 - 0.1, startup: 12, active: 6, endlag: 24, hx: -12, hy: 8, hw: 55, hh: 50, spike: true }
+    }
+  }
+};
+
+// ============================================================
+// Projectile
+// ============================================================
+class Projectile {
+  constructor(x, y, vx, vy, owner, attackData) {
+    this.x = x; this.y = y; this.vx = vx; this.vy = vy;
+    this.owner = owner; this.data = attackData;
+    this.w = 16; this.h = 12; this.life = 60; this.hit = false;
+  }
+  update() {
+    this.x += this.vx;
+    this.y += this.vy;
+    this.life--;
+  }
+  draw(ctx) {
+    ctx.fillStyle = this.owner.charData.color;
+    ctx.beginPath();
+    ctx.arc(this.x, this.y, 8, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = '#ffffff';
+    ctx.beginPath();
+    ctx.arc(this.x, this.y, 4, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  getHitbox() {
+    return { x: this.x - 10, y: this.y - 10, w: 20, h: 20 };
+  }
+}
+
+// ============================================================
+// Item System
+// ============================================================
+const ITEM_TYPES = {
+  beamSword: { name: 'ビームソード', color: '#00ffff', effect: 'sword', duration: 600 },
+  heart: { name: 'ハートの器', color: '#ff69b4', effect: 'heal' },
+  bobOmb: { name: 'ボム兵', color: '#333333', effect: 'bomb' },
+  fan: { name: 'ハリセン', color: '#ffdd00', effect: 'fan', duration: 450 }
+};
+
+class Item {
+  constructor(x, y, type) {
+    this.x = x; this.y = y; this.type = type;
+    this.vy = 0; this.grounded = false; this.life = 600;
+    this.w = 20; this.h = 20; this.bobPhase = Math.random() * Math.PI * 2;
+  }
+  update(platforms) {
+    if (!this.grounded) {
+      this.vy += GRAVITY * 0.5;
+      this.y += this.vy;
+      for (const p of platforms) {
+        if (this.y + 10 >= p.y && this.y + 10 <= p.y + 10 && this.x >= p.x && this.x <= p.x + p.w && this.vy > 0) {
+          this.y = p.y - 10;
+          this.vy = 0;
+          this.grounded = true;
+        }
+      }
+    }
+    this.bobPhase += 0.05;
+    this.life--;
+  }
+  draw(ctx) {
+    const bob = this.grounded ? Math.sin(this.bobPhase) * 3 : 0;
+    const itemData = Object.values(ITEM_TYPES).find(t => t === this.type);
+    ctx.fillStyle = this.type.color;
+    ctx.strokeStyle = '#ffffff';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(this.x, this.y + bob, 10, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.stroke();
+    ctx.fillStyle = '#fff';
+    ctx.font = '8px Arial';
+    ctx.textAlign = 'center';
+    ctx.fillText(this.type.name.charAt(0), this.x, this.y + bob + 3);
+  }
+}
+
+// ============================================================
+// AI Controller
+// ============================================================
+const AI_LEVELS = {
+  1: { name: 'よわい',    color: '#66cc66', reactionDelay: 20, aggressiveness: 0.25, dodgeSkill: 0.1,  edgeguardSkill: 0.0, comboSkill: 0.05, mistakeChance: 0.25 },
+  2: { name: 'ふつう',    color: '#66aaff', reactionDelay: 12, aggressiveness: 0.45, dodgeSkill: 0.25, edgeguardSkill: 0.1, comboSkill: 0.2,  mistakeChance: 0.12 },
+  3: { name: 'つよい',    color: '#ffaa44', reactionDelay: 6,  aggressiveness: 0.65, dodgeSkill: 0.5,  edgeguardSkill: 0.4, comboSkill: 0.45, mistakeChance: 0.05 },
+  4: { name: 'とてもつよい', color: '#ff4444', reactionDelay: 3,  aggressiveness: 0.8,  dodgeSkill: 0.7,  edgeguardSkill: 0.6, comboSkill: 0.65, mistakeChance: 0.02 },
+  5: { name: 'さいきょう', color: '#cc44ff', reactionDelay: 1,  aggressiveness: 0.9,  dodgeSkill: 0.85, edgeguardSkill: 0.8, comboSkill: 0.8,  mistakeChance: 0.0  }
+};
+
+class AIController {
+  constructor(level) {
+    level = level || 3;
+    const cfg = AI_LEVELS[level] || AI_LEVELS[3];
+    this.controls = {};
+    this.actionTimer = 0;
+    this.currentAction = 'idle';
+    this.reactionDelay = cfg.reactionDelay;
+    this.reactionTimer = 0;
+    this.aggressiveness = cfg.aggressiveness;
+    this.dodgeSkill = cfg.dodgeSkill;
+    this.edgeguardSkill = cfg.edgeguardSkill;
+    this.comboSkill = cfg.comboSkill;
+    this.mistakeChance = cfg.mistakeChance;
+    this.targetX = 0;
+    this.targetY = 0;
+    this.prevAttackDetected = false;
+  }
+
+  getControls(fighter, opponent, platforms) {
+    // Reset controls each frame
+    const c = { left: false, right: false, up: false, down: false,
+                jump: false, attack1: false, attack2: false, special: false, shield: false };
+
+    if (fighter.state === FIGHTER_STATE.DEAD || fighter.state === FIGHTER_STATE.RESPAWNING) return c;
+
+    // Reaction delay - AI doesn't react instantly
+    this.reactionTimer++;
+    if (this.reactionTimer < this.reactionDelay) {
+      return this.controls; // Return previous controls
+    }
+    this.reactionTimer = 0;
+
+    // Random mistake - sometimes do nothing (makes AI feel human)
+    if (Math.random() < this.mistakeChance) {
+      this.controls = c;
+      return c;
+    }
+
+    const dx = opponent.x - fighter.x;
+    const dy = opponent.y - fighter.y;
+    const dist = Math.sqrt(dx * dx + dy * dy);
+    const absDx = Math.abs(dx);
+    const opponentDir = dx > 0 ? 1 : -1;
+
+    // Always face opponent
+    if (dx > 10) c.right = true;
+    else if (dx < -10) c.left = true;
+
+    // --- STATE: Edge grab ---
+    if (fighter.state === FIGHTER_STATE.EDGE_GRAB) {
+      if (absDx < 150 && opponent.y < fighter.y) {
+        // Opponent above and close: attack from edge
+        c.attack1 = true;
+      } else {
+        c.jump = true;
+      }
+      this.controls = c;
+      return c;
+    }
+
+    // --- STATE: Hitstun - DI toward stage center ---
+    if (fighter.state === FIGHTER_STATE.HITSTUN) {
+      const stageCenter = BASE_W / 2;
+      if (fighter.x < stageCenter) c.right = true;
+      else c.left = true;
+      this.controls = c;
+      return c;
+    }
+
+    // --- Detect incoming attack and try to shield/dodge ---
+    const opponentAttacking = opponent.state === FIGHTER_STATE.ATTACK;
+    if (opponentAttacking && absDx < 80 && Math.random() < this.dodgeSkill) {
+      if (fighter.grounded) {
+        if (Math.random() < 0.5) {
+          c.shield = true; // Shield
+        } else {
+          c.shield = true;
+          // Roll away
+          if (dx > 0) c.left = true;
+          else c.right = true;
+        }
+        this.controls = c;
+        return c;
+      } else {
+        // Air dodge
+        if (Math.random() < this.dodgeSkill * 0.6) {
+          c.shield = true;
+          this.controls = c;
+          return c;
+        }
+      }
+    }
+
+    // --- Recovery: off-stage, try to get back ---
+    const mainPlat = platforms[0];
+    const stageLeft = mainPlat.x;
+    const stageRight = mainPlat.x + mainPlat.w;
+    const stageCenter = (stageLeft + stageRight) / 2;
+    const onStage = fighter.x > stageLeft - 20 && fighter.x < stageRight + 20;
+
+    // Preventive: stay away from edges when grounded
+    if (fighter.grounded && (fighter.x < stageLeft + 40 || fighter.x > stageRight - 40)) {
+      if (fighter.x < stageCenter) c.right = true;
+      else c.left = true;
+      this.controls = c;
+      return c;
+    }
+
+    if (!onStage) {
+      // Move toward stage center
+      if (fighter.x < stageCenter) c.right = true;
+      else c.left = true;
+
+      if (!fighter.grounded) {
+        // Jump to recover: use jumps strategically
+        if (fighter.jumpsRemaining > 0) {
+          // First jump immediately if falling
+          if (fighter.vy > 1) {
+            c.jump = true;
+          }
+          // Save second jump for when closer to stage height
+          if (fighter.jumpsRemaining === 1 && fighter.y > mainPlat.y - 50) {
+            c.jump = true;
+          }
+        }
+        // Use up-special as last resort when out of jumps and below stage
+        if (fighter.y > mainPlat.y - 30 && fighter.jumpsRemaining <= 0) {
+          c.special = true;
+        }
+      }
+      this.controls = c;
+      return c;
+    }
+
+    // --- Opponent off-stage: edgeguard attempt ---
+    const oppOnStage = opponent.x > mainPlat.x - 30 && opponent.x < mainPlat.x + mainPlat.w + 30;
+    if (!oppOnStage && !opponent.grounded && opponent.state !== FIGHTER_STATE.DEAD &&
+        opponent.state !== FIGHTER_STATE.RESPAWNING && Math.random() < this.edgeguardSkill) {
+      // Move to edge
+      if (opponent.x < mainPlat.x) {
+        this.targetX = mainPlat.x + 20;
+      } else {
+        this.targetX = mainPlat.x + mainPlat.w - 20;
+      }
+      if (Math.abs(fighter.x - this.targetX) > 15) {
+        if (fighter.x < this.targetX) c.right = true;
+        else c.left = true;
+      } else if (absDx < 120) {
+        // Attack at edge
+        c.attack1 = true;
+      }
+      this.controls = c;
+      return c;
+    }
+
+    // --- Main combat behavior ---
+    this.actionTimer--;
+    if (this.actionTimer <= 0) {
+      this.decideAction(fighter, opponent, dist, absDx, dy);
+    }
+
+    switch (this.currentAction) {
+      case 'approach':
+        if (absDx > 60) {
+          if (dx > 0) c.right = true; else c.left = true;
+        }
+        if (absDx < 80) {
+          this.currentAction = 'attack';
+          this.actionTimer = 5;
+        }
+        break;
+
+      case 'attack':
+        if (absDx < 70 && Math.abs(dy) < 50) {
+          // Choose attack based on opponent damage
+          if (opponent.damage > 120 && Math.random() < 0.5) {
+            c.attack2 = true; // Smash at high percent
+          } else if (opponent.damage > 80 && Math.random() < 0.3) {
+            c.attack2 = true;
+          } else if (Math.random() < 0.6) {
+            if (absDx > 30) c.attack1 = true; // Ftilt range
+            else c.attack1 = true; // Jab range
+          } else {
+            c.special = true;
+          }
+        } else {
+          // Too far, re-approach
+          if (dx > 0) c.right = true; else c.left = true;
+        }
+        break;
+
+      case 'shortHop':
+        c.jump = true;
+        if (absDx < 100 && fighter.state === FIGHTER_STATE.AIRBORNE) {
+          if (dy > 20) c.attack1 = true; // Dair
+          else c.attack1 = true; // Fair/nair
+        }
+        this.actionTimer = 3;
+        this.currentAction = 'aerial';
+        break;
+
+      case 'aerial':
+        if (dx > 0) c.right = true; else c.left = true;
+        if (!fighter.grounded && absDx < 80) {
+          if (dy > 30 && Math.random() < 0.4) {
+            c.down = true;
+            c.attack1 = true; // Dair
+          } else {
+            c.attack1 = true; // Fair/nair
+          }
+        }
+        break;
+
+      case 'retreatAndProjectile':
+        // Move away then use special
+        if (dx > 0) c.left = true; else c.right = true;
+        if (absDx > 200) {
+          c.special = true;
+        }
+        break;
+
+      case 'dashGrab':
+        if (dx > 0) c.right = true; else c.left = true;
+        if (absDx < 50) c.attack1 = true;
+        break;
+
+      case 'waitAndPunish':
+        // Stand still, shield if they approach, attack after
+        if (opponentAttacking && absDx < 100) {
+          c.shield = true;
+        } else if (!opponentAttacking && absDx < 70) {
+          c.attack1 = true; // Punish
+        }
+        break;
+
+      case 'idle':
+      default:
+        // Slight movement to not look idle
+        if (Math.random() < 0.3 && absDx > 200) {
+          if (dx > 0) c.right = true; else c.left = true;
+        }
+        break;
+    }
+
+    // --- Combo follow-up ---
+    if (opponent.state === FIGHTER_STATE.HITSTUN && Math.random() < this.comboSkill) {
+      if (absDx < 100) {
+        if (opponent.y < fighter.y - 30) {
+          // Opponent above: jump and aerial
+          c.jump = true;
+          c.attack1 = true;
+        } else {
+          c.attack1 = true;
+        }
+      } else {
+        if (dx > 0) c.right = true; else c.left = true;
+      }
+    }
+
+    // --- Fast fall when above opponent ---
+    if (!fighter.grounded && fighter.vy > 0 && fighter.y < opponent.y - 50 && absDx < 50) {
+      c.down = true;
+    }
+
+    this.controls = c;
+    return c;
+  }
+
+  decideAction(fighter, opponent, dist, absDx, dy) {
+    const roll = Math.random();
+
+    if (dist < 80) {
+      // Close range
+      if (roll < 0.35) { this.currentAction = 'attack'; this.actionTimer = 15; }
+      else if (roll < 0.55) { this.currentAction = 'shortHop'; this.actionTimer = 20; }
+      else if (roll < 0.7) { this.currentAction = 'waitAndPunish'; this.actionTimer = 30; }
+      else if (roll < 0.85) { this.currentAction = 'dashGrab'; this.actionTimer = 15; }
+      else { this.currentAction = 'retreatAndProjectile'; this.actionTimer = 40; }
+    } else if (dist < 200) {
+      // Mid range
+      if (roll < this.aggressiveness * 0.6) { this.currentAction = 'approach'; this.actionTimer = 25; }
+      else if (roll < this.aggressiveness * 0.8) { this.currentAction = 'shortHop'; this.actionTimer = 20; }
+      else if (roll < 0.8) { this.currentAction = 'retreatAndProjectile'; this.actionTimer = 35; }
+      else { this.currentAction = 'waitAndPunish'; this.actionTimer = 40; }
+    } else {
+      // Far range
+      if (roll < this.aggressiveness) { this.currentAction = 'approach'; this.actionTimer = 30; }
+      else if (roll < 0.8) { this.currentAction = 'retreatAndProjectile'; this.actionTimer = 40; }
+      else { this.currentAction = 'idle'; this.actionTimer = 20; }
+    }
+  }
+}
+
+// ============================================================
+// Fighter Class
+// ============================================================
+const FIGHTER_STATE = {
+  IDLE: 'idle', WALK: 'walk', RUN: 'run', CROUCH: 'crouch', JUMP_SQUAT: 'jumpSquat',
+  AIRBORNE: 'airborne', ATTACK: 'attack', HITSTUN: 'hitstun',
+  SHIELD: 'shield', DODGE: 'dodge', EDGE_GRAB: 'edgeGrab',
+  RESPAWNING: 'respawning', DEAD: 'dead', LANDING: 'landing'
+};
+
+class Fighter {
+  constructor(playerIndex, charKey, x, y) {
+    this.playerIndex = playerIndex;
+    this.charKey = charKey;
+    this.charData = CHARACTERS[charKey];
+    this.x = x;
+    this.y = y;
+    this.vx = 0;
+    this.vy = 0;
+    this.damage = 0;
+    this.stocks = SETTINGS.stocks;
+    this.facing = playerIndex === 0 ? 1 : -1;
+    this.state = FIGHTER_STATE.AIRBORNE;
+    this.grounded = false;
+    this.jumpsRemaining = 2;
+    this.fastFalling = false;
+    this.invincibleFrames = 0;
+    this.hitstunFrames = 0;
+    this.attackName = null;
+    this.attackFrame = 0;
+    this.attackHit = new Set();
+    this.shieldHealth = 100;
+    this.dodgeFrames = 0;
+    this.dodgeDir = 0;
+    this.jumpSquatFrames = 0;
+    this.landingLag = 0;
+    this.runFrames = 0;
+    this.smashCharge = 0;
+    this.smashCharging = false;
+    this.respawnTimer = 0;
+    this.respawnPlatY = 0;
+    this.edgeGrabCooldown = 0;
+    this.item = null;
+    this.itemDuration = 0;
+    this.multiHitTimer = 0;
+    this.animFrame = 0;
+    this.combo = 0;
+    this.lastHitBy = -1;
+    this.isAI = false;
+    this.aiController = null;
+    this.crouchFrames = 0;
+    this.dodgeCooldown = 0;
+    this.launchTrail = []; // positions for launch trail effect
+  }
+
+  get w() { return this.charData.size.w; }
+  get h() { return this.charData.size.h; }
+
+  getHurtbox() {
+    return { x: this.x - this.w/2, y: this.y - this.h, w: this.w, h: this.h };
+  }
+
+  getAttackHitbox() {
+    if (this.state !== FIGHTER_STATE.ATTACK || !this.attackName) return null;
+    const atk = this.charData.attacks[this.attackName];
+    if (!atk) return null;
+    if (this.attackFrame < atk.startup || this.attackFrame >= atk.startup + atk.active) return null;
+
+    const dir = this.facing;
+    let hy = this.y - this.h / 2 + atk.hy;
+    let hx;
+    if (dir === 1) {
+      // Facing right: hitbox extends from body center outward to the right
+      hx = this.x - this.w * 0.2 + atk.hx;
+    } else {
+      // Facing left: mirror the hitbox to the left
+      hx = this.x + this.w * 0.2 - atk.hx - atk.hw;
+    }
+
+    let dmgMult = 1;
+    if (this.attackName === 'smash') dmgMult = 1 + this.smashCharge * 0.015;
+    if (this.item && this.item.effect === 'sword') dmgMult *= 1.3;
+    if (this.item && this.item.effect === 'fan') dmgMult *= 0.8;
+
+    return {
+      x: hx, y: hy, w: atk.hw, h: atk.hh,
+      damage: atk.damage * dmgMult,
+      baseKB: atk.baseKB * (this.attackName === 'smash' ? 1 + this.smashCharge * 0.01 : 1),
+      kbGrowth: atk.kbGrowth,
+      angle: atk.angle,
+      spike: atk.spike,
+      owner: this
+    };
+  }
+
+  startAttack(name) {
+    if (this.state === FIGHTER_STATE.ATTACK || this.state === FIGHTER_STATE.HITSTUN ||
+        this.state === FIGHTER_STATE.DODGE || this.state === FIGHTER_STATE.RESPAWNING ||
+        this.state === FIGHTER_STATE.SHIELD) return;
+    this.state = FIGHTER_STATE.ATTACK;
+    this.attackName = name;
+    this.attackFrame = 0;
+    this.attackHit.clear();
+    this.smashCharge = 0;
+    this.smashCharging = false;
+  }
+
+  applyKnockback(hitbox) {
+    // Add damage first (like Smash Bros: damage is added before knockback calc)
+    this.damage += hitbox.damage;
+
+    // Smash Bros-style knockback formula:
+    // KB = (damage * attackDamage * kbGrowth / 50 + baseKB) / weight
+    // The key: at low %, knockback is modest. At high % it scales dramatically.
+    const rawKB = ((this.damage * hitbox.damage * hitbox.kbGrowth) / 50 + hitbox.baseKB);
+    const weightMod = 1 / this.charData.weight;
+    const totalKB = rawKB * weightMod;
+
+    let angle = hitbox.angle;
+    if (hitbox.spike) angle = Math.abs(angle);
+    const dir = hitbox.owner.facing;
+
+    this.vx = Math.cos(angle) * totalKB * dir;
+    this.vy = Math.sin(angle) * totalKB;
+    if (!hitbox.spike) this.vy = Math.min(this.vy, -Math.abs(totalKB) * 0.3);
+
+    this.hitstunFrames = Math.floor(Math.min(totalKB * HITSTUN_MULTIPLIER * 6, 90));
+    this.state = FIGHTER_STATE.HITSTUN;
+    this.grounded = false;
+    this.lastHitBy = hitbox.owner.playerIndex;
+    this.combo++;
+
+    // --- Finish blow detection ---
+    // A big knockback that will likely KO: trigger dramatic effect
+    const isSmashAttack = hitbox.owner.attackName === 'smash';
+    const isStrongHit = totalKB > 12;
+    const isFinisher = totalKB > 18 || (isSmashAttack && totalKB > 14);
+
+    if (isFinisher) {
+      // Dramatic finish blow!
+      triggerFinishEffect(this.x, this.y - this.h / 2, angle * dir, hitbox.owner.charData.color, this);
+      game.hitlag = 8; // Brief dramatic freeze
+      triggerShake(15, 25);
+      // Big particle burst (capped count)
+      const colors = ['#ffffff', '#ffff00', '#ff8800', hitbox.owner.charData.color];
+      for (let i = 0; i < 20; i++) {
+        const a = Math.random() * Math.PI * 2;
+        const spd = 4 + Math.random() * 10;
+        addParticle(new Particle(
+          this.x, this.y - this.h / 2,
+          Math.cos(a) * spd, Math.sin(a) * spd,
+          colors[Math.floor(Math.random() * colors.length)],
+          20 + Math.random() * 15, 5 + Math.random() * 8
+        ));
+      }
+      // Sound is played inside triggerFinishEffect, not here
+    } else if (isStrongHit) {
+      // Strong hit but not a finisher
+      game.hitlag = Math.min(Math.floor(totalKB / 3), 6);
+      triggerShake(Math.min(totalKB / 2, 12), Math.min(Math.floor(totalKB), 18));
+      spawnHitParticles(this.x, this.y - this.h / 2, Math.floor(totalKB * 3), hitbox.owner.charData.color);
+      playHitSound(totalKB / 4);
+    } else {
+      // Normal hit
+      game.hitlag = Math.min(Math.floor(hitbox.damage / 3), 6);
+      triggerShake(Math.min(totalKB / 3, 6), Math.min(Math.floor(totalKB), 10));
+      spawnHitParticles(this.x, this.y - this.h / 2, Math.floor(totalKB * 2), hitbox.owner.charData.color);
+      playHitSound(totalKB / 5);
+    }
+  }
+
+  die() {
+    this.stocks--;
+
+    // Determine which blast zone was hit for the KO effect
+    let blastX = Math.max(0, Math.min(BASE_W, this.x));
+    let blastY = Math.max(0, Math.min(BASE_H, this.y));
+    let side = 'right';
+    if (this.x < BLAST_ZONE.left + 50) { blastX = 0; side = 'left'; }
+    else if (this.x > BLAST_ZONE.right - 50) { blastX = BASE_W; side = 'right'; }
+    else if (this.y < BLAST_ZONE.top + 50) { blastY = 0; side = 'top'; }
+    else { blastY = BASE_H; side = 'bottom'; }
+    triggerKOBlast(blastX, blastY, side);
+
+    spawnExplosion(blastX, blastY);
+    playKOSound();
+    triggerShake(15, 20);
+    if (this.stocks > 0) {
+      this.state = FIGHTER_STATE.RESPAWNING;
+      this.respawnTimer = 90;
+      this.damage = 0;
+      this.vx = 0;
+      this.vy = 0;
+      this.combo = 0;
+    } else {
+      this.state = FIGHTER_STATE.DEAD;
+    }
+  }
+
+  respawn(spawnPoint) {
+    this.x = spawnPoint.x;
+    this.y = spawnPoint.y - 100;
+    this.respawnPlatY = spawnPoint.y - 80;
+    this.vx = 0;
+    this.vy = 0;
+    this.invincibleFrames = RESPAWN_INVINCIBILITY;
+    this.state = FIGHTER_STATE.AIRBORNE;
+    this.grounded = false;
+    this.jumpsRemaining = 2;
+    this.fastFalling = false;
+    this.attackName = null;
+    this.item = null;
+  }
+
+  update(input, platforms, opponent) {
+    this.animFrame++;
+    if (this.invincibleFrames > 0) this.invincibleFrames--;
+    if (this.edgeGrabCooldown > 0) this.edgeGrabCooldown--;
+    if (this.dodgeCooldown > 0) this.dodgeCooldown--;
+    if (this.itemDuration > 0) { this.itemDuration--; if (this.itemDuration <= 0) this.item = null; }
+
+    if (this.state === FIGHTER_STATE.RESPAWNING) {
+      this.respawnTimer--;
+      if (this.respawnTimer <= 0) {
+        const stage = game.currentStage;
+        const sp = stage.spawnPoints[this.playerIndex];
+        this.respawn(sp);
+      }
+      return;
+    }
+    if (this.state === FIGHTER_STATE.DEAD) return;
+
+    const controls = this.getControls(input, opponent, platforms);
+
+    // =========================================
+    // State-specific logic (NO early returns)
+    // =========================================
+
+    // DI (Directional Influence) during hitstun
+    if (this.state === FIGHTER_STATE.HITSTUN) {
+      if (controls.left) this.vx -= DI_STRENGTH;
+      if (controls.right) this.vx += DI_STRENGTH;
+      // Launch trail: record position if flying fast
+      const speed = Math.sqrt(this.vx * this.vx + this.vy * this.vy);
+      if (speed > 8) {
+        this.launchTrail.push({ x: this.x, y: this.y - this.h / 2, alpha: 1.0 });
+        if (this.launchTrail.length > 20) this.launchTrail.shift();
+      }
+      this.hitstunFrames--;
+      if (this.hitstunFrames <= 0) {
+        this.state = this.grounded ? FIGHTER_STATE.IDLE : FIGHTER_STATE.AIRBORNE;
+        this.combo = 0;
+      }
+    }
+
+    // Fade out launch trail when not in hitstun
+    if (this.state !== FIGHTER_STATE.HITSTUN) {
+      for (const t of this.launchTrail) t.alpha -= 0.1;
+      this.launchTrail = this.launchTrail.filter(t => t.alpha > 0);
+    }
+
+    // Landing lag
+    if (this.state === FIGHTER_STATE.LANDING) {
+      this.landingLag--;
+      if (this.landingLag <= 0) this.state = FIGHTER_STATE.IDLE;
+    }
+
+    // Attack update
+    else if (this.state === FIGHTER_STATE.ATTACK) {
+      // Smash charge
+      if (this.attackName === 'smash' && this.smashCharging && this.attackFrame < this.charData.attacks.smash.startup) {
+        if (controls.attack2) {
+          this.smashCharge = Math.min(this.smashCharge + 1, 60);
+          // Don't advance attack frame while charging, but still do physics below
+        } else {
+          this.smashCharging = false;
+        }
+      }
+      if (!(this.attackName === 'smash' && this.smashCharging && this.attackFrame < this.charData.attacks.smash.startup && controls.attack2)) {
+        this.attackFrame++;
+      }
+      const atk = this.charData.attacks[this.attackName];
+      if (atk) {
+        const totalFrames = atk.startup + atk.active + atk.endlag;
+        // Movement during special uppercut
+        if (this.attackName === 'special' && atk.isUppercut && this.attackFrame >= atk.startup && this.attackFrame < atk.startup + atk.active) {
+          this.vy = -8;
+        }
+        if (this.attackFrame >= totalFrames) {
+          this.state = this.grounded ? FIGHTER_STATE.IDLE : FIGHTER_STATE.AIRBORNE;
+          this.attackName = null;
+        }
+      }
+    }
+
+    // Shield
+    else if (this.state === FIGHTER_STATE.SHIELD) {
+      // Completely stop movement while shielding
+      this.vx = 0;
+      this.runFrames = 0;
+
+      this.shieldHealth -= 0.3;
+      if (!controls.shield || this.shieldHealth <= 0) {
+        if (this.shieldHealth <= 0) {
+          this.hitstunFrames = 120;
+          this.state = FIGHTER_STATE.HITSTUN;
+          this.vy = -10;
+          playSound(200, 'sawtooth', 0.3, 0.15);
+        } else {
+          this.state = FIGHTER_STATE.IDLE;
+        }
+      }
+      // Dodge roll: requires justPressed direction + no cooldown (prevents spamming)
+      else if (this.dodgeCooldown <= 0 && (controls.left || controls.right)) {
+        this.state = FIGHTER_STATE.DODGE;
+        this.dodgeFrames = 16;
+        this.dodgeDir = controls.left ? -1 : 1;
+        this.invincibleFrames = 10;
+        this.dodgeCooldown = 40; // Can't dodge again for 40 frames
+      }
+      this.shieldHealth = Math.min(this.shieldHealth + 0.05, 100);
+    }
+
+    // Dodge
+    else if (this.state === FIGHTER_STATE.DODGE) {
+      this.dodgeFrames--;
+      // Dodge roll speed (slower than before, and decelerates)
+      const dodgeSpeed = this.dodgeDir * 4 * (this.dodgeFrames / 16);
+      this.x += dodgeSpeed;
+      if (this.dodgeFrames <= 0) {
+        this.state = this.grounded ? FIGHTER_STATE.IDLE : FIGHTER_STATE.AIRBORNE;
+        this.vx = 0; // Stop completely after dodge
+      }
+    }
+
+    // Edge grab
+    else if (this.state === FIGHTER_STATE.EDGE_GRAB) {
+      if (controls.jump) {
+        this.vy = this.charData.jumpForce;
+        this.state = FIGHTER_STATE.AIRBORNE;
+        this.jumpsRemaining = 1;
+        this.edgeGrabCooldown = 30;
+        playJumpSound();
+      } else if (controls.down) {
+        this.state = FIGHTER_STATE.AIRBORNE;
+        this.edgeGrabCooldown = 30;
+      } else if (controls.attack1) {
+        this.state = FIGHTER_STATE.AIRBORNE;
+        this.edgeGrabCooldown = 30;
+        this.y -= this.h;
+        this.startAttack('ftilt');
+      }
+      // Edge grab: no physics, skip to blast zone check
+      if (this.state === FIGHTER_STATE.EDGE_GRAB) {
+        // Still grabbing, no movement
+        if (this.x < BLAST_ZONE.left || this.x > BLAST_ZONE.right ||
+            this.y < BLAST_ZONE.top || this.y > BLAST_ZONE.bottom) {
+          this.die();
+        }
+        return;
+      }
+    }
+
+    // Grounded movement & actions
+    else if (this.grounded) {
+      this.jumpsRemaining = 2;
+      this.fastFalling = false;
+
+      // --- Crouch / Drop-through ---
+      if (controls.down && !controls.left && !controls.right && !controls.jump) {
+        this.runFrames = 0;
+        this.vx *= FRICTION;
+        if (Math.abs(this.vx) < 0.5) this.vx = 0;
+
+        if (this.state !== FIGHTER_STATE.CROUCH) {
+          this.state = FIGHTER_STATE.CROUCH;
+          this.crouchFrames = 0;
+        }
+        this.crouchFrames++;
+
+        // Drop through passthrough platform after crouching for 8 frames
+        if (this.crouchFrames >= 8) {
+          const plat = this.getCurrentPlatform(platforms);
+          if (plat && plat.type === 'passthrough') {
+            this.y += 8;
+            this.grounded = false;
+            this.state = FIGHTER_STATE.AIRBORNE;
+            this.crouchFrames = 0;
+          }
+        }
+      }
+      // --- Movement (walk / run) ---
+      else if (controls.left || controls.right) {
+        this.crouchFrames = 0;
+        const dir = controls.left ? -1 : 1;
+        this.facing = dir;
+        this.runFrames++;
+        // Gradual acceleration: walk first, transition to run after 15 frames
+        const isRunning = this.runFrames > 15;
+        const targetSpeed = (isRunning ? this.charData.runSpeed : this.charData.walkSpeed) * SETTINGS.speedScale;
+        // Smooth acceleration instead of instant speed
+        const accel = isRunning ? 0.4 : 0.3;
+        this.vx += (targetSpeed * dir - this.vx) * accel;
+        this.state = isRunning ? FIGHTER_STATE.RUN : FIGHTER_STATE.WALK;
+      }
+      // --- Idle ---
+      else {
+        this.runFrames = 0;
+        this.crouchFrames = 0;
+        this.vx *= FRICTION;
+        if (Math.abs(this.vx) < 0.8) this.vx = 0;
+        this.state = FIGHTER_STATE.IDLE;
+      }
+
+      // Jump (can jump from crouch too)
+      if (controls.jump && this.jumpsRemaining > 0) {
+        this.vy = this.charData.jumpForce;
+        this.grounded = false;
+        this.state = FIGHTER_STATE.AIRBORNE;
+        this.jumpsRemaining--;
+        this.crouchFrames = 0;
+        playJumpSound();
+      }
+
+      // Attacks
+      if (controls.attack1 && this.state !== FIGHTER_STATE.CROUCH) {
+        if (controls.left || controls.right) this.startAttack('ftilt');
+        else this.startAttack('jab');
+      }
+      // Down attack from crouch
+      if (controls.attack1 && this.state === FIGHTER_STATE.CROUCH) {
+        this.startAttack('ftilt'); // down-tilt equivalent
+      }
+      if (controls.attack2) {
+        this.startAttack('smash');
+        this.smashCharging = true;
+        this.crouchFrames = 0;
+      }
+      if (controls.special) {
+        this.startAttack('special');
+        this.crouchFrames = 0;
+      }
+
+      // Shield
+      if (controls.shield && this.grounded && this.state !== FIGHTER_STATE.CROUCH) {
+        this.state = FIGHTER_STATE.SHIELD;
+      }
+    }
+
+    // Airborne movement & actions
+    else {
+      // Air control: gentler than ground movement
+      const airAccel = 0.35 * SETTINGS.speedScale;
+      if (controls.left) { this.vx -= airAccel; this.facing = -1; }
+      if (controls.right) { this.vx += airAccel; this.facing = 1; }
+      const airSpeedCap = this.charData.runSpeed * 0.85 * SETTINGS.speedScale;
+      this.vx = Math.max(-airSpeedCap, Math.min(airSpeedCap, this.vx));
+
+      // Air jump
+      if (controls.jump && this.jumpsRemaining > 0 && this.state !== FIGHTER_STATE.HITSTUN) {
+        this.vy = this.charData.airJumpForce;
+        this.jumpsRemaining--;
+        this.fastFalling = false;
+        playJumpSound();
+      }
+
+      // Fast fall
+      if (controls.down && this.vy > 0 && !this.fastFalling && this.state !== FIGHTER_STATE.HITSTUN) {
+        this.fastFalling = true;
+      }
+
+      // Air attacks
+      if (this.state === FIGHTER_STATE.AIRBORNE) {
+        if (controls.attack1) {
+          if (controls.down) this.startAttack('dair');
+          else if (controls.left || controls.right) this.startAttack('fair');
+          else this.startAttack('nair');
+        }
+        if (controls.special) {
+          this.startAttack('special');
+        }
+      }
+
+      // Air dodge (with cooldown)
+      if (controls.shield && this.state === FIGHTER_STATE.AIRBORNE && this.dodgeCooldown <= 0) {
+        this.state = FIGHTER_STATE.DODGE;
+        this.dodgeFrames = 18;
+        this.invincibleFrames = 12;
+        this.dodgeDir = 0;
+        this.vx *= 0.3;
+        this.vy *= 0.3;
+        this.dodgeCooldown = 50; // Longer cooldown in air
+      }
+    }
+
+    // =========================================
+    // Physics (ALWAYS runs)
+    // =========================================
+    if (!this.grounded) {
+      this.vy += GRAVITY;
+      if (this.fastFalling) this.vy = Math.min(this.vy, FAST_FALL_SPEED);
+      else this.vy = Math.min(this.vy, MAX_FALL_SPEED);
+    }
+
+    this.x += this.vx;
+    this.y += this.vy;
+
+    if (!this.grounded) this.vx *= AIR_FRICTION;
+
+    // =========================================
+    // Platform collision (ALWAYS runs)
+    // =========================================
+    // Drop through only happens via the crouch→drop logic above (sets state to AIRBORNE and y+=8)
+    // The collision code should NOT independently drop through; it just respects that the fighter
+    // has already been moved below the platform by the crouch logic.
+    const wantDropThrough = false;
+
+    const prevGrounded = this.grounded;
+    this.grounded = false;
+    for (const p of platforms) {
+      const onPlatformX = this.x >= p.x - this.w / 2 && this.x <= p.x + p.w + this.w / 2;
+
+      // Wall collision for solid platforms (check even if not on platform X for edge cases)
+      if (p.type === 'solid') {
+        const hb = this.getHurtbox();
+        // Left wall
+        if (hb.x + hb.w > p.x && hb.x < p.x && this.y > p.y + 4 && this.y < p.y + p.h + this.h) {
+          this.x = p.x - this.w / 2;
+          if (this.vx > 0) this.vx = 0;
+        }
+        // Right wall
+        if (hb.x < p.x + p.w && hb.x + hb.w > p.x + p.w && this.y > p.y + 4 && this.y < p.y + p.h + this.h) {
+          this.x = p.x + p.w + this.w / 2;
+          if (this.vx < 0) this.vx = 0;
+        }
+      }
+
+      if (!onPlatformX) continue;
+
+      // Floor collision: already standing on surface
+      if (Math.abs(this.y - p.y) <= 5 && this.vy >= -0.1) {
+        if (p.type === 'solid' || !wantDropThrough) {
+          this.y = p.y;
+          this.vy = 0;
+          this.grounded = true;
+          if (this.state === FIGHTER_STATE.AIRBORNE) this.state = FIGHTER_STATE.IDLE;
+          break;
+        }
+      }
+
+      // Floor collision: falling through surface this frame
+      if (this.vy > 0) {
+        const feetY = this.y;
+        const prevFeetY = feetY - this.vy;
+        if (feetY >= p.y && prevFeetY < p.y) {
+          if (p.type === 'solid' || !wantDropThrough) {
+            this.y = p.y;
+            this.vy = 0;
+            this.grounded = true;
+            if (this.state === FIGHTER_STATE.AIRBORNE) this.state = FIGHTER_STATE.IDLE;
+            break;
+          }
+        }
+        // Extra safety: if significantly below surface, snap up (prevents tunneling)
+        if (p.type === 'solid' && feetY > p.y && feetY < p.y + p.h && prevFeetY <= p.y + 2) {
+          this.y = p.y;
+          this.vy = 0;
+          this.grounded = true;
+          if (this.state === FIGHTER_STATE.AIRBORNE) this.state = FIGHTER_STATE.IDLE;
+          break;
+        }
+      }
+
+      // Ceiling collision for solid platforms
+      if (p.type === 'solid' && this.vy < 0) {
+        const headY = this.y - this.h;
+        if (headY < p.y + p.h && headY > p.y && this.y > p.y + p.h) {
+          this.y = p.y + p.h + this.h;
+          this.vy = 0;
+        }
+      }
+    }
+
+    // If just landed, update state
+    if (this.grounded && !prevGrounded) {
+      if (this.state === FIGHTER_STATE.AIRBORNE) this.state = FIGHTER_STATE.IDLE;
+      this.fastFalling = false;
+      this.jumpsRemaining = 2;
+    }
+
+    // Edge grab detection
+    if (!this.grounded && this.vy >= 0 && this.edgeGrabCooldown <= 0 && this.state !== FIGHTER_STATE.HITSTUN) {
+      for (const p of platforms) {
+        if (p.type !== 'solid') continue;
+        const myY = this.y - this.h * 0.3;
+        if (myY > p.y - 15 && myY < p.y + 15) {
+          // Left edge
+          if (this.facing === 1 && Math.abs(this.x - p.x) < 20) {
+            this.state = FIGHTER_STATE.EDGE_GRAB;
+            this.x = p.x - 5;
+            this.y = p.y + this.h * 0.3;
+            this.vx = 0; this.vy = 0;
+          }
+          // Right edge
+          if (this.facing === -1 && Math.abs(this.x - (p.x + p.w)) < 20) {
+            this.state = FIGHTER_STATE.EDGE_GRAB;
+            this.x = p.x + p.w + 5;
+            this.y = p.y + this.h * 0.3;
+            this.vx = 0; this.vy = 0;
+          }
+        }
+      }
+    }
+
+    // Blast zone check
+    if (this.x < BLAST_ZONE.left || this.x > BLAST_ZONE.right ||
+        this.y < BLAST_ZONE.top || this.y > BLAST_ZONE.bottom) {
+      this.die();
+    }
+  }
+
+  getCurrentPlatform(platforms) {
+    for (const p of platforms) {
+      if (Math.abs(this.y - p.y) < 3 && this.x >= p.x - this.w/2 && this.x <= p.x + p.w + this.w/2) {
+        return p;
+      }
+    }
+    return null;
+  }
+
+  getControls(input, opponent, platforms) {
+    if (this.isAI && this.aiController) {
+      return this.aiController.getControls(this, opponent, platforms);
+    }
+    return {
+      left: input.isDown('KeyA'),
+      right: input.isDown('KeyD'),
+      up: input.isDown('KeyW'),
+      down: input.isDown('KeyS'),
+      jump: input.justPressed('KeyW'),
+      attack1: input.justPressed('KeyJ'),
+      attack2: input.isDown('KeyK'),
+      special: input.justPressed('KeyL'),
+      shield: input.isDown('KeyH')
+    };
+  }
+
+  draw(ctx) {
+    if (this.state === FIGHTER_STATE.DEAD) return;
+    if (this.state === FIGHTER_STATE.RESPAWNING) {
+      // Draw respawn indicator
+      ctx.globalAlpha = 0.3 + Math.sin(this.animFrame * 0.2) * 0.2;
+      ctx.fillStyle = this.charData.color;
+      const stage = game.currentStage;
+      const sp = stage.spawnPoints[this.playerIndex];
+      ctx.beginPath();
+      ctx.arc(sp.x, sp.y - 100, 20, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.globalAlpha = 1;
+      return;
+    }
+
+    // Invincibility flash
+    if (this.invincibleFrames > 0 && Math.floor(this.animFrame / 3) % 2 === 0) {
+      ctx.globalAlpha = 0.4;
+    }
+
+    // Shield
+    if (this.state === FIGHTER_STATE.SHIELD) {
+      ctx.fillStyle = `rgba(100, 200, 255, ${this.shieldHealth / 200 + 0.2})`;
+      ctx.beginPath();
+      ctx.arc(this.x, this.y - this.h / 2, this.shieldHealth / 100 * 35 + 10, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    // Dodge effect
+    if (this.state === FIGHTER_STATE.DODGE) {
+      ctx.globalAlpha = 0.3;
+    }
+
+    // Launch trail
+    if (this.launchTrail.length > 1) {
+      for (let i = 0; i < this.launchTrail.length; i++) {
+        const t = this.launchTrail[i];
+        const size = (i / this.launchTrail.length) * 12 + 4;
+        ctx.globalAlpha = t.alpha * 0.5 * (i / this.launchTrail.length);
+        ctx.fillStyle = this.charData.color;
+        ctx.beginPath();
+        ctx.arc(t.x, t.y, size, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      ctx.globalAlpha = 1;
+    }
+
+    const cx = this.x;
+    const cy = this.y;
+    const dir = this.facing;
+    const isCrouching = this.state === FIGHTER_STATE.CROUCH;
+    // Crouch squishes the character down
+    const squish = isCrouching ? 0.6 : 1.0;
+    const squishW = isCrouching ? 1.2 : 1.0;
+
+    // Body
+    ctx.fillStyle = this.charData.color;
+    ctx.strokeStyle = this.charData.outlineColor;
+    ctx.lineWidth = 2;
+
+    // Torso
+    const bodyW = this.w * 0.7 * squishW;
+    const bodyH = this.h * 0.45 * squish;
+    const bodyY = cy - this.h * 0.6 * squish;
+    ctx.fillRect(cx - bodyW/2, bodyY, bodyW, bodyH);
+    ctx.strokeRect(cx - bodyW/2, bodyY, bodyW, bodyH);
+
+    // Head
+    const headR = this.w * 0.32;
+    const headY = cy - this.h * 0.78 * squish;
+    ctx.beginPath();
+    ctx.arc(cx, headY, headR, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.stroke();
+
+    // Eyes
+    ctx.fillStyle = '#fff';
+    ctx.beginPath();
+    ctx.arc(cx + dir * 4, headY - 2, 4, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = '#000';
+    ctx.beginPath();
+    ctx.arc(cx + dir * 5, headY - 2, 2, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Legs
+    ctx.strokeStyle = this.charData.outlineColor;
+    ctx.lineWidth = 4;
+    let legAngle = 0;
+    if (this.state === FIGHTER_STATE.WALK || this.state === FIGHTER_STATE.RUN) {
+      const legSpeed = this.state === FIGHTER_STATE.RUN ? 0.18 : 0.12;
+      legAngle = Math.sin(this.animFrame * legSpeed) * 0.4;
+    }
+    if (isCrouching) {
+      // Crouching legs: bent outward
+      ctx.beginPath();
+      ctx.moveTo(cx - 6, cy - this.h * 0.1);
+      ctx.lineTo(cx - 14, cy);
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.moveTo(cx + 6, cy - this.h * 0.1);
+      ctx.lineTo(cx + 14, cy);
+      ctx.stroke();
+    } else {
+      // Left leg
+      ctx.beginPath();
+      ctx.moveTo(cx - 6, cy - this.h * 0.15);
+      ctx.lineTo(cx - 6 + Math.sin(legAngle) * 12, cy);
+      ctx.stroke();
+      // Right leg
+      ctx.beginPath();
+      ctx.moveTo(cx + 6, cy - this.h * 0.15);
+      ctx.lineTo(cx + 6 - Math.sin(legAngle) * 12, cy);
+      ctx.stroke();
+    }
+
+    // Arms
+    ctx.lineWidth = 3;
+    let armAngle = 0;
+    if (this.state === FIGHTER_STATE.ATTACK) {
+      const atk = this.charData.attacks[this.attackName];
+      if (atk && this.attackFrame >= atk.startup && this.attackFrame < atk.startup + atk.active) {
+        armAngle = dir * 1.2;
+      } else if (atk && this.attackFrame < atk.startup) {
+        armAngle = -dir * 0.5;
+      }
+    }
+    // Front arm
+    ctx.strokeStyle = this.charData.color;
+    ctx.beginPath();
+    ctx.moveTo(cx + dir * 8, bodyY + 8);
+    ctx.lineTo(cx + dir * 8 + Math.cos(armAngle) * 20 * dir, bodyY + 8 + Math.sin(armAngle) * 20);
+    ctx.stroke();
+    // Back arm
+    ctx.beginPath();
+    ctx.moveTo(cx - dir * 5, bodyY + 8);
+    ctx.lineTo(cx - dir * 5 - dir * 10, bodyY + 15);
+    ctx.stroke();
+
+    // Item visual
+    if (this.item) {
+      ctx.fillStyle = this.item.color;
+      ctx.fillRect(cx + dir * 18, cy - this.h * 0.5, 6, 25);
+    }
+
+    // Attack hitbox visualization (debug-ish but looks cool)
+    if (this.state === FIGHTER_STATE.ATTACK) {
+      const hitbox = this.getAttackHitbox();
+      if (hitbox) {
+        ctx.fillStyle = 'rgba(255, 255, 100, 0.3)';
+        ctx.fillRect(hitbox.x, hitbox.y, hitbox.w, hitbox.h);
+      }
+    }
+
+    // Edge grab
+    if (this.state === FIGHTER_STATE.EDGE_GRAB) {
+      ctx.fillStyle = '#ffff00';
+      ctx.beginPath();
+      ctx.arc(cx + dir * -10, cy - this.h * 0.5, 3, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    // Hitstun effect
+    if (this.state === FIGHTER_STATE.HITSTUN) {
+      ctx.strokeStyle = '#ff0000';
+      ctx.lineWidth = 1;
+      for (let i = 0; i < 3; i++) {
+        const ox = (Math.random() - 0.5) * 20;
+        const oy = (Math.random() - 0.5) * 20;
+        ctx.beginPath();
+        ctx.arc(cx + ox, cy - this.h/2 + oy, 3 + Math.random() * 5, 0, Math.PI * 2);
+        ctx.stroke();
+      }
+    }
+
+    ctx.globalAlpha = 1;
+
+    // Player indicator
+    ctx.fillStyle = this.charData.color;
+    ctx.font = 'bold 12px Arial';
+    ctx.textAlign = 'center';
+    ctx.fillText(this.isAI ? 'CPU' : `P${this.playerIndex + 1}`, cx, cy - this.h - 10);
+
+    // Damage percentage above head when hit
+    if (this.state === FIGHTER_STATE.HITSTUN) {
+      ctx.fillStyle = '#ff4444';
+      ctx.font = 'bold 14px Arial';
+      ctx.fillText(`${Math.floor(this.damage)}%`, cx, cy - this.h - 25);
+    }
+  }
+}
+
+// ============================================================
+// Game Class
+// ============================================================
+class Game {
+  constructor() {
+    this.state = STATE.TITLE;
+    this.input = new InputManager();
+    this.fighters = [];
+    this.projectiles = [];
+    this.items = [];
+    this.currentStage = null;
+    this.stageKey = 'battlefield';
+    this.charSelections = [null, null];
+    this.charSelectCursors = [0, 0];
+    this.stageSelectCursor = 0;
+    this.countdownTimer = 0;
+    this.frameCount = 0;
+    this.itemSpawnTimer = 0;
+    this.charKeys = Object.keys(CHARACTERS);
+    this.stageKeys = Object.keys(STAGES);
+    this.titleBlink = 0;
+    this.victoryTimer = 0;
+    this.winner = -1;
+    this.hitlag = 0;
+    this.aiLevel = 3;
+    this.diffSelectCursor = 2; // index 0-4, default to level 3
+    // Pause menu
+    this.pauseCursor = 0;
+    this.pauseTab = 'main'; // 'main', 'settings', 'controls'
+    this.settingsCursor = 0;
+    this.presPauseState = null; // state before pause
+  }
+
+  start() {
+    this.loop();
+  }
+
+  loop() {
+    this.update();
+    this.render();
+    this.input.update();
+    requestAnimationFrame(() => this.loop());
+  }
+
+  update() {
+    this.frameCount++;
+
+    if (this.hitlag > 0) {
+      this.hitlag--;
+      // Still update effects during hitlag so they animate
+      updateShake();
+      for (let i = particles.length - 1; i >= 0; i--) {
+        particles[i].update();
+        if (particles[i].life <= 0) particles.splice(i, 1);
+      }
+      return;
+    }
+
+    updateShake();
+
+    switch (this.state) {
+      case STATE.TITLE: this.updateTitle(); break;
+      case STATE.CHAR_SELECT: this.updateCharSelect(); break;
+      case STATE.DIFF_SELECT: this.updateDiffSelect(); break;
+      case STATE.STAGE_SELECT: this.updateStageSelect(); break;
+      case STATE.COUNTDOWN: this.updateCountdown(); break;
+      case STATE.FIGHTING: this.updateFighting(); break;
+      case STATE.PAUSED: this.updatePaused(); break;
+      case STATE.VICTORY: this.updateVictory(); break;
+    }
+  }
+
+  updateTitle() {
+    this.titleBlink++;
+    if (this.input.justPressed('Space') || this.input.justPressed('Enter')) {
+      this.state = STATE.CHAR_SELECT;
+      this.charSelections = [null, null];
+      this.charSelectCursors = [0, 2];
+      ensureAudio();
+      playMenuSound();
+    }
+  }
+
+  updateCharSelect() {
+    // P1 controls
+    if (this.charSelections[0] === null) {
+      if (this.input.justPressed('KeyA') || this.input.justPressed('ArrowLeft')) {
+        this.charSelectCursors[0] = Math.max(0, this.charSelectCursors[0] - 1); playMenuSound();
+      }
+      if (this.input.justPressed('KeyD') || this.input.justPressed('ArrowRight')) {
+        this.charSelectCursors[0] = Math.min(this.charKeys.length - 1, this.charSelectCursors[0] + 1); playMenuSound();
+      }
+      if (this.input.justPressed('KeyJ') || this.input.justPressed('KeyW') || this.input.justPressed('Space') || this.input.justPressed('Enter')) {
+        this.charSelections[0] = this.charKeys[this.charSelectCursors[0]];
+        // CPU auto-selects a random character
+        const cpuChoice = this.charKeys[Math.floor(Math.random() * this.charKeys.length)];
+        this.charSelections[1] = cpuChoice;
+        playSound(600, 'sine', 0.1, 0.1);
+        // Go to difficulty select
+        this.state = STATE.DIFF_SELECT;
+        return;
+      }
+    }
+    // Back
+    if (this.input.justPressed('Escape')) {
+      this.state = STATE.TITLE;
+    }
+  }
+
+  updateDiffSelect() {
+    if (this.input.justPressed('KeyA') || this.input.justPressed('ArrowLeft')) {
+      this.diffSelectCursor = Math.max(0, this.diffSelectCursor - 1); playMenuSound();
+    }
+    if (this.input.justPressed('KeyD') || this.input.justPressed('ArrowRight')) {
+      this.diffSelectCursor = Math.min(4, this.diffSelectCursor + 1); playMenuSound();
+    }
+    if (this.input.justPressed('KeyJ') || this.input.justPressed('KeyW') || this.input.justPressed('Space') || this.input.justPressed('Enter')) {
+      this.aiLevel = this.diffSelectCursor + 1;
+      playSound(600, 'sine', 0.1, 0.1);
+      this.state = STATE.STAGE_SELECT;
+      this.stageSelectCursor = 0;
+    }
+    if (this.input.justPressed('Escape')) {
+      this.state = STATE.CHAR_SELECT;
+      this.charSelections = [null, null];
+    }
+  }
+
+  updateStageSelect() {
+    if (this.input.justPressed('KeyA') || this.input.justPressed('ArrowLeft')) {
+      this.stageSelectCursor = Math.max(0, this.stageSelectCursor - 1); playMenuSound();
+    }
+    if (this.input.justPressed('KeyD') || this.input.justPressed('ArrowRight')) {
+      this.stageSelectCursor = Math.min(this.stageKeys.length - 1, this.stageSelectCursor + 1); playMenuSound();
+    }
+    if (this.input.justPressed('KeyJ') || this.input.justPressed('Numpad1') || this.input.justPressed('Space') || this.input.justPressed('Enter')) {
+      this.stageKey = this.stageKeys[this.stageSelectCursor];
+      this.startMatch();
+    }
+    if (this.input.justPressed('Escape')) {
+      this.state = STATE.DIFF_SELECT;
+    }
+  }
+
+  startMatch() {
+    this.currentStage = STAGES[this.stageKey];
+    const sp = this.currentStage.spawnPoints;
+    const p1 = new Fighter(0, this.charSelections[0], sp[0].x, sp[0].y);
+    p1.grounded = true;
+    p1.state = FIGHTER_STATE.IDLE;
+    const p2 = new Fighter(1, this.charSelections[1], sp[1].x, sp[1].y);
+    p2.grounded = true;
+    p2.state = FIGHTER_STATE.IDLE;
+    p2.isAI = true;
+    p2.aiController = new AIController(this.aiLevel);
+    this.fighters = [p1, p2];
+    this.projectiles = [];
+    this.items = [];
+    particles.length = 0;
+    this.countdownTimer = 180;
+    this.state = STATE.COUNTDOWN;
+    this.itemSpawnTimer = 600;
+    playSound(400, 'sine', 0.2, 0.1);
+  }
+
+  updateCountdown() {
+    if (this.input.justPressed('Escape')) {
+      this.prePauseState = STATE.COUNTDOWN;
+      this.state = STATE.PAUSED;
+      this.pauseCursor = 0;
+      this.pauseTab = 'main';
+      this.settingsCursor = 0;
+      playMenuSound();
+      return;
+    }
+    this.countdownTimer--;
+    if (this.countdownTimer <= 0) {
+      this.state = STATE.FIGHTING;
+      playSound(800, 'square', 0.15, 0.15);
+    } else if (this.countdownTimer % 60 === 0) {
+      playSound(500, 'sine', 0.1, 0.1);
+    }
+  }
+
+  updateFighting() {
+    // Pause
+    if (this.input.justPressed('Escape')) {
+      this.prePauseState = STATE.FIGHTING;
+      this.state = STATE.PAUSED;
+      this.pauseCursor = 0;
+      this.pauseTab = 'main';
+      this.settingsCursor = 0;
+      playMenuSound();
+      return;
+    }
+
+    const platforms = this.currentStage.platforms;
+    const f1 = this.fighters[0];
+    const f2 = this.fighters[1];
+
+    f1.update(this.input, platforms, f2);
+    f2.update(this.input, platforms, f1);
+
+    // Attack collision detection
+    this.checkAttackCollision(f1, f2);
+    this.checkAttackCollision(f2, f1);
+
+    // Projectile spawning
+    for (const f of this.fighters) {
+      if (f.state === FIGHTER_STATE.ATTACK && f.attackName === 'special') {
+        const atk = f.charData.attacks.special;
+        if (atk.isProjectile && f.attackFrame === atk.startup) {
+          this.projectiles.push(new Projectile(
+            f.x + f.facing * 30, f.y - f.h / 2,
+            f.facing * atk.projSpeed, 0, f, atk
+          ));
+        }
+      }
+    }
+
+    // Projectile update
+    for (let i = this.projectiles.length - 1; i >= 0; i--) {
+      const proj = this.projectiles[i];
+      proj.update();
+      if (proj.life <= 0 || proj.hit) { this.projectiles.splice(i, 1); continue; }
+      // Hit detection
+      for (const f of this.fighters) {
+        if (f === proj.owner || f.state === FIGHTER_STATE.DEAD || f.state === FIGHTER_STATE.RESPAWNING || f.invincibleFrames > 0) continue;
+        const hb = proj.getHitbox();
+        const fb = f.getHurtbox();
+        if (this.boxOverlap(hb, fb)) {
+          f.applyKnockback({
+            damage: proj.data.damage,
+            baseKB: proj.data.baseKB,
+            kbGrowth: proj.data.kbGrowth,
+            angle: proj.data.angle,
+            spike: false,
+            owner: proj.owner
+          });
+          proj.hit = true;
+          spawnHitParticles(f.x, f.y - f.h/2, 8, proj.owner.charData.color);
+        }
+      }
+    }
+
+    // Item spawn
+    this.itemSpawnTimer--;
+    if (this.itemSpawnTimer <= 0 && SETTINGS.items) {
+      this.spawnItem();
+      this.itemSpawnTimer = 500 + Math.random() * 400;
+    }
+
+    // Item update
+    for (let i = this.items.length - 1; i >= 0; i--) {
+      const item = this.items[i];
+      item.update(platforms);
+      if (item.life <= 0) { this.items.splice(i, 1); continue; }
+      // Pickup detection
+      for (const f of this.fighters) {
+        if (f.state === FIGHTER_STATE.DEAD || f.state === FIGHTER_STATE.RESPAWNING) continue;
+        if (f.item) continue;
+        const dx = f.x - item.x;
+        const dy = (f.y - f.h/2) - item.y;
+        if (Math.abs(dx) < 25 && Math.abs(dy) < 30) {
+          this.pickupItem(f, item);
+          this.items.splice(i, 1);
+          break;
+        }
+      }
+    }
+
+    // Particles
+    for (let i = particles.length - 1; i >= 0; i--) {
+      particles[i].update();
+      if (particles[i].life <= 0) particles.splice(i, 1);
+    }
+
+    // Win condition
+    if (f1.state === FIGHTER_STATE.DEAD) { this.winner = 1; this.state = STATE.VICTORY; this.victoryTimer = 0; }
+    if (f2.state === FIGHTER_STATE.DEAD) { this.winner = 0; this.state = STATE.VICTORY; this.victoryTimer = 0; }
+  }
+
+  checkAttackCollision(attacker, defender) {
+    if (attacker.state !== FIGHTER_STATE.ATTACK) return;
+    if (defender.state === FIGHTER_STATE.DEAD || defender.state === FIGHTER_STATE.RESPAWNING) return;
+    if (defender.invincibleFrames > 0) return;
+    if (defender.state === FIGHTER_STATE.DODGE) return;
+
+    const hitbox = attacker.getAttackHitbox();
+    if (!hitbox) return;
+    if (attacker.attackHit.has(defender.playerIndex)) return;
+
+    const hurtbox = defender.getHurtbox();
+    if (this.boxOverlap(hitbox, hurtbox)) {
+      if (defender.state === FIGHTER_STATE.SHIELD) {
+        // Shield hit
+        defender.shieldHealth -= hitbox.damage * 1.5;
+        defender.vx = attacker.facing * hitbox.baseKB * 0.3;
+        spawnHitParticles(defender.x, defender.y - defender.h/2, 5, '#88ccff');
+        playSound(300, 'sine', 0.1, 0.1);
+        attacker.attackHit.add(defender.playerIndex);
+      } else {
+        defender.applyKnockback(hitbox);
+        attacker.attackHit.add(defender.playerIndex);
+        // hitlag is now set inside applyKnockback based on strength
+      }
+    }
+  }
+
+  boxOverlap(a, b) {
+    return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
+  }
+
+  spawnItem() {
+    const types = Object.values(ITEM_TYPES);
+    const type = types[Math.floor(Math.random() * types.length)];
+    const stage = this.currentStage;
+    const mainPlat = stage.platforms[0];
+    const x = mainPlat.x + 50 + Math.random() * (mainPlat.w - 100);
+    const y = mainPlat.y - 200;
+    this.items.push(new Item(x, y, type));
+  }
+
+  pickupItem(fighter, item) {
+    if (item.type.effect === 'heal') {
+      fighter.damage = Math.max(0, fighter.damage - 50);
+      spawnHitParticles(fighter.x, fighter.y - fighter.h/2, 10, '#ff69b4');
+      playSound(1000, 'sine', 0.15, 0.1);
+    } else if (item.type.effect === 'bomb') {
+      // Throw bomb at opponent
+      const opponent = this.fighters.find(f => f !== fighter);
+      if (opponent && opponent.state !== FIGHTER_STATE.DEAD) {
+        opponent.applyKnockback({
+          damage: 25, baseKB: 10, kbGrowth: 0.3, angle: -0.7,
+          spike: false, owner: fighter
+        });
+        spawnExplosion(opponent.x, opponent.y - opponent.h/2);
+      }
+    } else {
+      fighter.item = item.type;
+      fighter.itemDuration = item.type.duration || 300;
+      playSound(700, 'sine', 0.1, 0.08);
+    }
+  }
+
+  updatePaused() {
+    const MAIN_ITEMS = ['つづける', '試合設定', '操作方法', 'やりなおす', 'タイトルへ戻る'];
+    const SETTINGS_ITEMS = [
+      { key: 'speedScale', label: '移動速度' },
+      { key: 'stocks', label: 'ストック数' },
+      { key: 'items', label: 'アイテム' },
+    ];
+
+    if (this.pauseTab === 'main') {
+      if (this.input.justPressed('KeyW') || this.input.justPressed('ArrowUp')) {
+        this.pauseCursor = (this.pauseCursor - 1 + MAIN_ITEMS.length) % MAIN_ITEMS.length;
+        playMenuSound();
+      }
+      if (this.input.justPressed('KeyS') || this.input.justPressed('ArrowDown')) {
+        this.pauseCursor = (this.pauseCursor + 1) % MAIN_ITEMS.length;
+        playMenuSound();
+      }
+      if (this.input.justPressed('KeyJ') || this.input.justPressed('Space') || this.input.justPressed('Enter')) {
+        switch (this.pauseCursor) {
+          case 0: // つづける
+            this.state = this.prePauseState || STATE.FIGHTING;
+            playMenuSound();
+            break;
+          case 1: // 試合設定
+            this.pauseTab = 'settings';
+            this.settingsCursor = 0;
+            playMenuSound();
+            break;
+          case 2: // 操作方法
+            this.pauseTab = 'controls';
+            playMenuSound();
+            break;
+          case 3: // やりなおす
+            this.startMatch();
+            playMenuSound();
+            break;
+          case 4: // タイトルへ戻る
+            this.state = STATE.TITLE;
+            playMenuSound();
+            break;
+        }
+        return;
+      }
+      if (this.input.justPressed('Escape')) {
+        this.state = this.prePauseState || STATE.FIGHTING;
+        playMenuSound();
+      }
+    }
+
+    else if (this.pauseTab === 'settings') {
+      if (this.input.justPressed('KeyW') || this.input.justPressed('ArrowUp')) {
+        this.settingsCursor = (this.settingsCursor - 1 + SETTINGS_ITEMS.length) % SETTINGS_ITEMS.length;
+        playMenuSound();
+      }
+      if (this.input.justPressed('KeyS') || this.input.justPressed('ArrowDown')) {
+        this.settingsCursor = (this.settingsCursor + 1) % SETTINGS_ITEMS.length;
+        playMenuSound();
+      }
+      const item = SETTINGS_ITEMS[this.settingsCursor];
+      if (this.input.justPressed('KeyA') || this.input.justPressed('ArrowLeft')) {
+        this.adjustSetting(item.key, -1);
+        playMenuSound();
+      }
+      if (this.input.justPressed('KeyD') || this.input.justPressed('ArrowRight')) {
+        this.adjustSetting(item.key, 1);
+        playMenuSound();
+      }
+      if (this.input.justPressed('Escape') || this.input.justPressed('KeyH')) {
+        this.pauseTab = 'main';
+        playMenuSound();
+      }
+    }
+
+    else if (this.pauseTab === 'controls') {
+      if (this.input.justPressed('Escape') || this.input.justPressed('KeyH') ||
+          this.input.justPressed('KeyJ') || this.input.justPressed('Space') || this.input.justPressed('Enter')) {
+        this.pauseTab = 'main';
+        playMenuSound();
+      }
+    }
+  }
+
+  adjustSetting(key, dir) {
+    if (key === 'speedScale') {
+      const idx = SPEED_PRESETS.findIndex(p => Math.abs(p.value - SETTINGS.speedScale) < 0.01);
+      const newIdx = Math.max(0, Math.min(SPEED_PRESETS.length - 1, idx + dir));
+      SETTINGS.speedScale = SPEED_PRESETS[newIdx].value;
+    } else if (key === 'stocks') {
+      SETTINGS.stocks = Math.max(1, Math.min(5, SETTINGS.stocks + dir));
+    } else if (key === 'items') {
+      SETTINGS.items = !SETTINGS.items;
+    }
+  }
+
+  updateVictory() {
+    this.victoryTimer++;
+    for (let i = particles.length - 1; i >= 0; i--) {
+      particles[i].update();
+      if (particles[i].life <= 0) particles.splice(i, 1);
+    }
+    // Confetti
+    if (this.victoryTimer % 5 === 0 && this.victoryTimer < 200) {
+      const colors = ['#ff4444', '#44ff44', '#4444ff', '#ffff44', '#ff44ff'];
+      addParticle(new Particle(
+        100 + Math.random() * (BASE_W - 200), -10,
+        (Math.random() - 0.5) * 3, 1 + Math.random() * 2,
+        colors[Math.floor(Math.random() * colors.length)],
+        80 + Math.random() * 40, 6
+      ));
+    }
+    if (this.input.justPressed('Space') || this.input.justPressed('Enter')) {
+      this.state = STATE.CHAR_SELECT;
+      this.charSelections = [null, null];
+      this.charSelectCursors = [0, 2];
+    }
+    if (this.input.justPressed('Escape')) {
+      this.state = STATE.TITLE;
+    }
+  }
+
+  // ============================================================
+  // Rendering
+  // ============================================================
+  render() {
+    ctx.save();
+    ctx.translate(shakeX, shakeY);
+
+    switch (this.state) {
+      case STATE.TITLE: this.renderTitle(); break;
+      case STATE.CHAR_SELECT: this.renderCharSelect(); break;
+      case STATE.DIFF_SELECT: this.renderDiffSelect(); break;
+      case STATE.STAGE_SELECT: this.renderStageSelect(); break;
+      case STATE.COUNTDOWN: this.renderFight(); this.renderCountdown(); break;
+      case STATE.FIGHTING: this.renderFight(); break;
+      case STATE.PAUSED: this.renderFight(); this.renderPauseMenu(); break;
+      case STATE.VICTORY: this.renderFight(); this.renderVictory(); break;
+    }
+
+    ctx.restore();
+  }
+
+  renderTitle() {
+    // Background
+    const grad = ctx.createLinearGradient(0, 0, 0, BASE_H);
+    grad.addColorStop(0, '#0a0a3a');
+    grad.addColorStop(1, '#1a0a2e');
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, BASE_W, BASE_H);
+
+    // Stars
+    for (let i = 0; i < 50; i++) {
+      const sx = (i * 137 + this.frameCount * 0.2) % BASE_W;
+      const sy = (i * 97) % BASE_H;
+      ctx.fillStyle = `rgba(255,255,255,${0.3 + Math.sin(this.frameCount * 0.03 + i) * 0.3})`;
+      ctx.fillRect(sx, sy, 2, 2);
+    }
+
+    // Title
+    ctx.textAlign = 'center';
+
+    // Main title with glow
+    ctx.shadowColor = '#ff6600';
+    ctx.shadowBlur = 20;
+    ctx.fillStyle = '#ff8800';
+    ctx.font = 'bold 56px Arial';
+    ctx.fillText('スマッシュ', BASE_W/2, 200);
+    ctx.fillStyle = '#ffcc00';
+    ctx.font = 'bold 48px Arial';
+    ctx.fillText('ファイターズ', BASE_W/2, 265);
+    ctx.shadowBlur = 0;
+
+    // Subtitle
+    ctx.fillStyle = '#aaaacc';
+    ctx.font = '20px Arial';
+    ctx.fillText('~ 大乱闘バトル ~', BASE_W/2, 310);
+
+    // Press start
+    if (Math.floor(this.titleBlink / 30) % 2 === 0) {
+      ctx.fillStyle = '#ffffff';
+      ctx.font = '22px Arial';
+      ctx.fillText('PRESS SPACE / ENTER', BASE_W/2, 420);
+    }
+
+    // Controls
+    ctx.fillStyle = '#8888aa';
+    ctx.font = '14px Arial';
+    ctx.fillText('WASD移動 / S:しゃがみ(すり抜け) / J攻撃 / Kスマッシュ / L必殺 / Hシールド', BASE_W/2, 510);
+    ctx.fillStyle = '#666688';
+    ctx.font = '13px Arial';
+    ctx.fillText('対戦相手: CPU', BASE_W/2, 535);
+
+    // Version
+    ctx.fillStyle = '#555577';
+    ctx.font = '12px Arial';
+    ctx.fillText('v1.0', BASE_W/2, BASE_H - 20);
+  }
+
+  renderCharSelect() {
+    ctx.fillStyle = '#111133';
+    ctx.fillRect(0, 0, BASE_W, BASE_H);
+
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#ffffff';
+    ctx.font = 'bold 32px Arial';
+    ctx.fillText('キャラクター選択', BASE_W/2, 60);
+
+    const charEntries = Object.entries(CHARACTERS);
+    const spacing = 250;
+    const startX = BASE_W/2 - (charEntries.length - 1) * spacing / 2;
+
+    charEntries.forEach(([key, char], i) => {
+      const x = startX + i * spacing;
+      const y = 200;
+
+      // Selection box
+      const isP1Cursor = this.charSelectCursors[0] === i;
+      const isP2Cursor = this.charSelectCursors[1] === i;
+      const isP1Selected = this.charSelections[0] === key;
+      const isP2Selected = this.charSelections[1] === key;
+
+      ctx.strokeStyle = '#333355';
+      ctx.lineWidth = 2;
+      ctx.strokeRect(x - 90, y - 70, 180, 240);
+
+      if (isP1Cursor && this.charSelections[0] === null) {
+        ctx.strokeStyle = '#ff4444';
+        ctx.lineWidth = 3;
+        ctx.strokeRect(x - 93, y - 73, 186, 246);
+      }
+
+      // Character preview
+      ctx.fillStyle = char.color;
+      ctx.beginPath();
+      ctx.arc(x, y + 10, 35, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.strokeStyle = char.outlineColor;
+      ctx.lineWidth = 3;
+      ctx.stroke();
+
+      // Face
+      ctx.fillStyle = '#fff';
+      ctx.beginPath();
+      ctx.arc(x + 8, y + 5, 6, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = '#000';
+      ctx.beginPath();
+      ctx.arc(x + 10, y + 5, 3, 0, Math.PI * 2);
+      ctx.fill();
+
+      // Name
+      ctx.fillStyle = '#ffffff';
+      ctx.font = 'bold 20px Arial';
+      ctx.fillText(char.name, x, y + 80);
+
+      // Description
+      ctx.fillStyle = '#aaaacc';
+      ctx.font = '16px Arial';
+      ctx.fillText(char.description, x, y + 108);
+
+      // Stats
+      ctx.font = '13px Arial';
+      ctx.fillStyle = '#8888aa';
+      ctx.fillText(`重さ: ${'★'.repeat(Math.round(char.weight * 3))}${'☆'.repeat(5 - Math.round(char.weight * 3))}`, x, y + 135);
+      ctx.fillText(`速さ: ${'★'.repeat(Math.round(char.runSpeed / 2))}${'☆'.repeat(5 - Math.round(char.runSpeed / 2))}`, x, y + 155);
+
+      // Selected indicators
+      if (isP1Selected) {
+        ctx.fillStyle = '#ff4444';
+        ctx.font = 'bold 16px Arial';
+        ctx.fillText('P1 ✓', x - 40, y - 55);
+      }
+    });
+
+    // CPU label
+    ctx.fillStyle = '#4488ff';
+    ctx.font = 'bold 22px Arial';
+    ctx.fillText('対戦相手: CPU（ランダム）', BASE_W/2, BASE_H - 80);
+
+    // Instructions
+    ctx.fillStyle = '#666688';
+    ctx.font = '14px Arial';
+    ctx.fillText('A/D/←/→ 選択 → J/W/Space 決定  |  ESC: 戻る', BASE_W/2, BASE_H - 40);
+  }
+
+  renderDiffSelect() {
+    ctx.fillStyle = '#111133';
+    ctx.fillRect(0, 0, BASE_W, BASE_H);
+
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#ffffff';
+    ctx.font = 'bold 32px Arial';
+    ctx.fillText('CPUの強さを選択', BASE_W / 2, 70);
+
+    const levels = Object.entries(AI_LEVELS);
+    const spacing = 170;
+    const startX = BASE_W / 2 - (levels.length - 1) * spacing / 2;
+
+    levels.forEach(([lvl, cfg], i) => {
+      const x = startX + i * spacing;
+      const y = 280;
+      const selected = this.diffSelectCursor === i;
+
+      // Box
+      ctx.fillStyle = selected ? 'rgba(255,255,255,0.08)' : 'rgba(0,0,0,0)';
+      ctx.fillRect(x - 65, y - 100, 130, 200);
+      ctx.strokeStyle = selected ? cfg.color : '#333355';
+      ctx.lineWidth = selected ? 4 : 2;
+      ctx.strokeRect(x - 65, y - 100, 130, 200);
+
+      // Level number
+      ctx.fillStyle = cfg.color;
+      ctx.font = 'bold 48px Arial';
+      ctx.fillText(`Lv.${lvl}`, x, y - 20);
+
+      // Name
+      ctx.fillStyle = selected ? '#ffffff' : '#888899';
+      ctx.font = 'bold 20px Arial';
+      ctx.fillText(cfg.name, x, y + 30);
+
+      // Difficulty bar
+      const barW = 80;
+      const barH = 10;
+      const barX = x - barW / 2;
+      const barY = y + 50;
+      ctx.fillStyle = '#222244';
+      ctx.fillRect(barX, barY, barW, barH);
+      ctx.fillStyle = cfg.color;
+      ctx.fillRect(barX, barY, barW * (parseInt(lvl) / 5), barH);
+
+      // Selection arrow
+      if (selected) {
+        ctx.fillStyle = '#ffffff';
+        ctx.font = '20px Arial';
+        ctx.fillText('▼', x, y - 110);
+      }
+    });
+
+    ctx.fillStyle = '#666688';
+    ctx.font = '14px Arial';
+    ctx.fillText('A/D/←/→ 選択 → J/W/Space 決定  |  ESC: 戻る', BASE_W / 2, BASE_H - 40);
+  }
+
+  renderStageSelect() {
+    ctx.fillStyle = '#111133';
+    ctx.fillRect(0, 0, BASE_W, BASE_H);
+
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#ffffff';
+    ctx.font = 'bold 32px Arial';
+    ctx.fillText('ステージ選択', BASE_W/2, 60);
+
+    const stageEntries = Object.entries(STAGES);
+    const spacing = 280;
+    const startX = BASE_W/2 - (stageEntries.length - 1) * spacing / 2;
+
+    stageEntries.forEach(([key, stage], i) => {
+      const x = startX + i * spacing;
+      const y = 250;
+      const w = 220;
+      const h = 150;
+
+      // Preview
+      const grad = ctx.createLinearGradient(x - w/2, y - h/2, x - w/2, y + h/2);
+      grad.addColorStop(0, stage.bg.top);
+      grad.addColorStop(1, stage.bg.bottom);
+      ctx.fillStyle = grad;
+      ctx.fillRect(x - w/2, y - h/2, w, h);
+
+      // Mini platforms
+      const scale = 0.2;
+      for (const p of stage.platforms) {
+        ctx.fillStyle = p.type === 'solid' ? '#886644' : '#668844';
+        ctx.fillRect(
+          x - w/2 + (p.x - 162) * scale + 10,
+          y - h/2 + (p.y - 200) * scale,
+          p.w * scale,
+          p.h * scale * 2
+        );
+      }
+
+      // Border
+      ctx.strokeStyle = this.stageSelectCursor === i ? '#ffcc00' : '#444466';
+      ctx.lineWidth = this.stageSelectCursor === i ? 4 : 2;
+      ctx.strokeRect(x - w/2, y - h/2, w, h);
+
+      // Name
+      ctx.fillStyle = '#ffffff';
+      ctx.font = 'bold 20px Arial';
+      ctx.fillText(stage.name, x, y + h/2 + 35);
+    });
+
+    ctx.fillStyle = '#666688';
+    ctx.font = '14px Arial';
+    ctx.fillText('A/D/←/→選択 → J/Num1/Space決定  |  ESC: 戻る', BASE_W/2, BASE_H - 40);
+  }
+
+  renderFight() {
+    const stage = this.currentStage;
+
+    // Background
+    const grad = ctx.createLinearGradient(0, 0, 0, BASE_H);
+    grad.addColorStop(0, stage.bg.top);
+    grad.addColorStop(1, stage.bg.bottom);
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, BASE_W, BASE_H);
+
+    // Background stars
+    for (let i = 0; i < 30; i++) {
+      const sx = (i * 137) % BASE_W;
+      const sy = (i * 97) % (BASE_H * 0.6);
+      ctx.fillStyle = `rgba(255,255,255,${0.2 + Math.sin(this.frameCount * 0.02 + i) * 0.15})`;
+      ctx.fillRect(sx, sy, 2, 2);
+    }
+
+    // Platforms
+    for (const p of stage.platforms) {
+      if (p.type === 'solid') {
+        // Main platform
+        const platGrad = ctx.createLinearGradient(p.x, p.y, p.x, p.y + p.h);
+        platGrad.addColorStop(0, '#8B7355');
+        platGrad.addColorStop(1, '#5C4033');
+        ctx.fillStyle = platGrad;
+        ctx.fillRect(p.x, p.y, p.w, p.h);
+        // Top edge
+        ctx.fillStyle = '#A0926B';
+        ctx.fillRect(p.x, p.y, p.w, 4);
+        // Sides
+        ctx.fillStyle = '#4A3728';
+        ctx.fillRect(p.x, p.y + p.h, p.w, 60);
+        // Left/right edges
+        ctx.fillStyle = '#6B5B45';
+        ctx.fillRect(p.x - 3, p.y, 3, p.h + 60);
+        ctx.fillRect(p.x + p.w, p.y, 3, p.h + 60);
+      } else {
+        // Passthrough platform
+        ctx.fillStyle = '#6B8E5A';
+        ctx.fillRect(p.x, p.y, p.w, p.h);
+        ctx.fillStyle = '#8DB87C';
+        ctx.fillRect(p.x, p.y, p.w, 3);
+        // Support lines
+        ctx.strokeStyle = '#5A7A4A';
+        ctx.lineWidth = 2;
+        ctx.setLineDash([5, 5]);
+        ctx.beginPath();
+        ctx.moveTo(p.x + p.w * 0.3, p.y + p.h);
+        ctx.lineTo(p.x + p.w * 0.3, p.y + p.h + 20);
+        ctx.moveTo(p.x + p.w * 0.7, p.y + p.h);
+        ctx.lineTo(p.x + p.w * 0.7, p.y + p.h + 20);
+        ctx.stroke();
+        ctx.setLineDash([]);
+      }
+    }
+
+    // Items
+    for (const item of this.items) item.draw(ctx);
+
+    // Projectiles
+    for (const proj of this.projectiles) proj.draw(ctx);
+
+    // Fighters
+    for (const f of this.fighters) f.draw(ctx);
+
+    // Particles
+    for (const p of particles) p.draw(ctx);
+
+    // Finish blow effect
+    if (finishEffect && finishEffect.timer > 0) {
+      const fe = finishEffect;
+      const progress = 1 - fe.timer / fe.maxTimer;
+
+      // Radial speed lines from hit point
+      ctx.save();
+      ctx.translate(fe.x, fe.y);
+      const lineCount = 24;
+      for (let i = 0; i < lineCount; i++) {
+        const a = (i / lineCount) * Math.PI * 2;
+        const innerR = 20 + progress * 80;
+        const outerR = 60 + progress * 200;
+        const alpha = (1 - progress) * 0.7;
+        ctx.strokeStyle = `rgba(255, 255, 255, ${alpha})`;
+        ctx.lineWidth = 3 - progress * 2;
+        ctx.beginPath();
+        ctx.moveTo(Math.cos(a) * innerR, Math.sin(a) * innerR);
+        ctx.lineTo(Math.cos(a) * outerR, Math.sin(a) * outerR);
+        ctx.stroke();
+      }
+
+      // Central flash
+      if (fe.timer > fe.maxTimer - 8) {
+        const flashAlpha = (fe.timer - (fe.maxTimer - 8)) / 8;
+        ctx.fillStyle = `rgba(255, 255, 255, ${flashAlpha * 0.6})`;
+        ctx.fillRect(-BASE_W, -BASE_H, BASE_W * 3, BASE_H * 3);
+      }
+
+      // Impact ring
+      ctx.strokeStyle = fe.color;
+      ctx.lineWidth = 4 * (1 - progress);
+      ctx.beginPath();
+      ctx.arc(0, 0, 30 + progress * 150, 0, Math.PI * 2);
+      ctx.stroke();
+
+      ctx.restore();
+      fe.timer--;
+      if (fe.timer <= 0) finishEffect = null;
+    }
+
+    // KO blast effect at screen edge
+    if (koBlast && koBlast.timer > 0) {
+      const kb = koBlast;
+      const progress = 1 - kb.timer / 40;
+      const alpha = (1 - progress);
+
+      ctx.save();
+      ctx.translate(kb.x, kb.y);
+
+      // Star burst
+      const starPoints = 6;
+      const outerR = 40 + progress * 120;
+      const innerR = outerR * 0.4;
+      ctx.fillStyle = `rgba(255, 200, 50, ${alpha * 0.8})`;
+      ctx.beginPath();
+      for (let i = 0; i < starPoints * 2; i++) {
+        const a = (i / (starPoints * 2)) * Math.PI * 2 - Math.PI / 2;
+        const r = i % 2 === 0 ? outerR : innerR;
+        if (i === 0) ctx.moveTo(Math.cos(a) * r, Math.sin(a) * r);
+        else ctx.lineTo(Math.cos(a) * r, Math.sin(a) * r);
+      }
+      ctx.closePath();
+      ctx.fill();
+
+      // Inner white flash
+      ctx.fillStyle = `rgba(255, 255, 255, ${alpha * 0.9})`;
+      ctx.beginPath();
+      ctx.arc(0, 0, outerR * 0.4 * (1 - progress * 0.5), 0, Math.PI * 2);
+      ctx.fill();
+
+      // "KO" text
+      if (progress < 0.7) {
+        ctx.fillStyle = `rgba(255, 50, 50, ${alpha})`;
+        ctx.font = `bold ${40 + progress * 20}px Arial`;
+        ctx.textAlign = 'center';
+        ctx.strokeStyle = `rgba(0, 0, 0, ${alpha})`;
+        ctx.lineWidth = 4;
+        ctx.strokeText('KO!', 0, 10);
+        ctx.fillText('KO!', 0, 10);
+      }
+
+      ctx.restore();
+      kb.timer--;
+      if (kb.timer <= 0) koBlast = null;
+    }
+
+    // HUD
+    this.renderHUD();
+  }
+
+  renderHUD() {
+    // Bottom HUD bar
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.6)';
+    ctx.fillRect(0, BASE_H - 80, BASE_W, 80);
+
+    for (let i = 0; i < 2; i++) {
+      const f = this.fighters[i];
+      const hudX = i === 0 ? 180 : BASE_W - 180;
+
+      // Character name
+      ctx.fillStyle = f.charData.color;
+      ctx.font = 'bold 16px Arial';
+      ctx.textAlign = 'center';
+      const label = f.isAI ? `CPU Lv.${this.aiLevel}` : `P${i+1}`;
+      ctx.fillText(`${label} ${f.charData.name}`, hudX, BASE_H - 60);
+
+      // Damage percent
+      const dmg = Math.floor(f.damage);
+      let dmgColor = '#ffffff';
+      let dmgSize = 32;
+      if (dmg >= 50) dmgColor = '#ffcc00';
+      if (dmg >= 100) { dmgColor = '#ff8800'; dmgSize = 34; }
+      if (dmg >= 150) { dmgColor = '#ff4444'; dmgSize = 36; }
+      if (dmg >= 200) { dmgColor = '#ff0000'; dmgSize = 38; }
+      // Pulsing effect at high damage
+      if (dmg >= 100) {
+        const pulse = Math.sin(this.frameCount * 0.1) * 0.15;
+        ctx.globalAlpha = 0.85 + pulse;
+      }
+      ctx.fillStyle = dmgColor;
+      ctx.font = `bold ${dmgSize}px Arial`;
+      // Shadow for readability at high %
+      if (dmg >= 150) {
+        ctx.shadowColor = dmgColor;
+        ctx.shadowBlur = 8;
+      }
+      ctx.fillText(`${dmg}%`, hudX, BASE_H - 22);
+      ctx.shadowBlur = 0;
+      ctx.globalAlpha = 1;
+
+      // Stocks
+      for (let s = 0; s < f.stocks; s++) {
+        ctx.fillStyle = f.charData.color;
+        ctx.beginPath();
+        ctx.arc(hudX - 25 + s * 20, BASE_H - 8, 6, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.strokeStyle = '#ffffff';
+        ctx.lineWidth = 1;
+        ctx.stroke();
+      }
+    }
+
+    // Timer area (center)
+    ctx.fillStyle = '#ffffff';
+    ctx.font = '14px Arial';
+    ctx.textAlign = 'center';
+    ctx.fillText('VS', BASE_W/2, BASE_H - 35);
+  }
+
+  renderPauseMenu() {
+    // Dim overlay
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.65)';
+    ctx.fillRect(0, 0, BASE_W, BASE_H);
+
+    ctx.textAlign = 'center';
+
+    // PAUSE title
+    ctx.fillStyle = '#ffffff';
+    ctx.font = 'bold 36px Arial';
+    ctx.fillText('PAUSE', BASE_W / 2, 80);
+
+    if (this.pauseTab === 'main') {
+      const items = ['つづける', '試合設定', '操作方法', 'やりなおす', 'タイトルへ戻る'];
+      items.forEach((label, i) => {
+        const y = 170 + i * 55;
+        const selected = this.pauseCursor === i;
+
+        // Background
+        if (selected) {
+          ctx.fillStyle = 'rgba(255, 200, 50, 0.15)';
+          ctx.fillRect(BASE_W / 2 - 160, y - 22, 320, 44);
+        }
+
+        // Border
+        ctx.strokeStyle = selected ? '#ffcc00' : '#444466';
+        ctx.lineWidth = selected ? 2 : 1;
+        ctx.strokeRect(BASE_W / 2 - 160, y - 22, 320, 44);
+
+        // Text
+        ctx.fillStyle = selected ? '#ffcc00' : '#888899';
+        ctx.font = selected ? 'bold 22px Arial' : '20px Arial';
+        ctx.fillText(label, BASE_W / 2, y + 7);
+
+        // Arrow
+        if (selected) {
+          ctx.fillText('▶', BASE_W / 2 - 140, y + 7);
+        }
+      });
+
+      ctx.fillStyle = '#555577';
+      ctx.font = '13px Arial';
+      ctx.fillText('W/S/↑/↓: 選択  J/Space: 決定  ESC: 戻る', BASE_W / 2, BASE_H - 30);
+    }
+
+    else if (this.pauseTab === 'settings') {
+      ctx.fillStyle = '#ffcc00';
+      ctx.font = 'bold 24px Arial';
+      ctx.fillText('試合設定', BASE_W / 2, 130);
+
+      const settingsItems = [
+        { label: '移動速度', value: SPEED_PRESETS.find(p => Math.abs(p.value - SETTINGS.speedScale) < 0.01)?.label || 'ふつう' },
+        { label: 'ストック数', value: `${SETTINGS.stocks}` },
+        { label: 'アイテム', value: SETTINGS.items ? 'ON' : 'OFF' },
+      ];
+
+      settingsItems.forEach((item, i) => {
+        const y = 200 + i * 65;
+        const selected = this.settingsCursor === i;
+
+        if (selected) {
+          ctx.fillStyle = 'rgba(255, 200, 50, 0.1)';
+          ctx.fillRect(BASE_W / 2 - 220, y - 22, 440, 50);
+        }
+
+        ctx.strokeStyle = selected ? '#ffcc00' : '#444466';
+        ctx.lineWidth = selected ? 2 : 1;
+        ctx.strokeRect(BASE_W / 2 - 220, y - 22, 440, 50);
+
+        // Label
+        ctx.textAlign = 'left';
+        ctx.fillStyle = selected ? '#ffffff' : '#888899';
+        ctx.font = '20px Arial';
+        ctx.fillText(item.label, BASE_W / 2 - 190, y + 10);
+
+        // Value with arrows
+        ctx.textAlign = 'center';
+        ctx.fillStyle = selected ? '#ffcc00' : '#aaaacc';
+        ctx.font = 'bold 22px Arial';
+        ctx.fillText(item.value, BASE_W / 2 + 100, y + 10);
+
+        if (selected) {
+          ctx.fillStyle = '#ffcc00';
+          ctx.font = '18px Arial';
+          ctx.fillText('◀', BASE_W / 2 + 30, y + 10);
+          ctx.fillText('▶', BASE_W / 2 + 170, y + 10);
+        }
+      });
+
+      ctx.textAlign = 'center';
+
+      // Note about settings
+      ctx.fillStyle = '#777799';
+      ctx.font = '14px Arial';
+      ctx.fillText('※ ストック数の変更は次の試合から反映されます', BASE_W / 2, 430);
+
+      ctx.fillStyle = '#555577';
+      ctx.font = '13px Arial';
+      ctx.fillText('W/S/↑/↓: 項目選択  A/D/←/→: 値変更  ESC/H: 戻る', BASE_W / 2, BASE_H - 30);
+    }
+
+    else if (this.pauseTab === 'controls') {
+      ctx.fillStyle = '#ffcc00';
+      ctx.font = 'bold 24px Arial';
+      ctx.fillText('操作方法', BASE_W / 2, 130);
+
+      const controls = [
+        ['移動', 'W/A/S/D'],
+        ['ジャンプ', 'W (空中でもう一度で2段ジャンプ)'],
+        ['しゃがみ', 'S (すり抜け床の上で長押し → 下に降りる)'],
+        ['攻撃', 'J (方向キー + J で方向攻撃)'],
+        ['スマッシュ攻撃', 'K (長押しで溜め可能)'],
+        ['必殺技', 'L'],
+        ['シールド', 'H (方向キー + H で回避)'],
+        ['空中攻撃', '空中で J (方向で変化 / S+J でメテオ)'],
+        ['急降下', '空中で落下中に S'],
+        ['崖つかまり', '崖に向かって落下すると自動'],
+      ];
+
+      controls.forEach(([action, key], i) => {
+        const y = 170 + i * 36;
+        ctx.textAlign = 'right';
+        ctx.fillStyle = '#aaaacc';
+        ctx.font = 'bold 15px Arial';
+        ctx.fillText(action, BASE_W / 2 - 20, y);
+
+        ctx.textAlign = 'left';
+        ctx.fillStyle = '#ffffff';
+        ctx.font = '15px Arial';
+        ctx.fillText(key, BASE_W / 2 + 10, y);
+      });
+
+      ctx.textAlign = 'center';
+
+      // Tips
+      ctx.fillStyle = '#666688';
+      ctx.font = '13px Arial';
+      ctx.fillText('ダメージ%が高いほど吹っ飛びやすい! 場外に出るとKO!', BASE_W / 2, 545);
+
+      ctx.fillStyle = '#555577';
+      ctx.font = '13px Arial';
+      ctx.fillText('ESC/H/J/Space: 戻る', BASE_W / 2, BASE_H - 30);
+    }
+  }
+
+  renderCountdown() {
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.4)';
+    ctx.fillRect(0, 0, BASE_W, BASE_H);
+
+    ctx.textAlign = 'center';
+    const seconds = Math.ceil(this.countdownTimer / 60);
+    if (seconds > 0) {
+      const scale = 1 + (this.countdownTimer % 60) / 60 * 0.5;
+      ctx.font = `bold ${80 * scale}px Arial`;
+      ctx.fillStyle = '#ffffff';
+      ctx.shadowColor = '#ffcc00';
+      ctx.shadowBlur = 20;
+      ctx.fillText(seconds.toString(), BASE_W/2, BASE_H/2 + 20);
+      ctx.shadowBlur = 0;
+    }
+  }
+
+  renderVictory() {
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.5)';
+    ctx.fillRect(0, 0, BASE_W, BASE_H);
+
+    const winner = this.fighters[this.winner];
+
+    // Particles
+    for (const p of particles) p.draw(ctx);
+
+    ctx.textAlign = 'center';
+
+    // Victory text
+    ctx.shadowColor = winner.charData.color;
+    ctx.shadowBlur = 30;
+    ctx.fillStyle = '#ffffff';
+    ctx.font = 'bold 52px Arial';
+    ctx.fillText('GAME SET!', BASE_W/2, 180);
+
+    ctx.fillStyle = winner.charData.color;
+    ctx.font = 'bold 40px Arial';
+    const winLabel = winner.isAI ? 'CPU' : `P${this.winner + 1}`;
+    ctx.fillText(`${winLabel} ${winner.charData.name}`, BASE_W/2, 260);
+
+    ctx.fillStyle = '#ffcc00';
+    ctx.font = 'bold 36px Arial';
+    ctx.fillText('WIN!', BASE_W/2, 310);
+    ctx.shadowBlur = 0;
+
+    // Winner character big display
+    ctx.fillStyle = winner.charData.color;
+    ctx.beginPath();
+    ctx.arc(BASE_W/2, 420, 50, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = winner.charData.outlineColor;
+    ctx.lineWidth = 4;
+    ctx.stroke();
+    ctx.fillStyle = '#fff';
+    ctx.beginPath();
+    ctx.arc(BASE_W/2 + 12, 412, 10, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = '#000';
+    ctx.beginPath();
+    ctx.arc(BASE_W/2 + 15, 412, 5, 0, Math.PI * 2);
+    ctx.fill();
+    // Smile
+    ctx.strokeStyle = '#000';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(BASE_W/2 + 5, 425, 12, 0.1, Math.PI - 0.1);
+    ctx.stroke();
+
+    if (this.victoryTimer > 60) {
+      ctx.fillStyle = '#aaaacc';
+      ctx.font = '20px Arial';
+      ctx.fillText('SPACE: 再戦  |  ESC: タイトル', BASE_W/2, 540);
+    }
+  }
+}
+
+// ============================================================
+// Start Game
+// ============================================================
+const game = new Game();
+game.start();
+
+</script>
+</body>
+</html>
