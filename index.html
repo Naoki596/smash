@@ -1607,8 +1607,34 @@ class Game {
   }
 
   loop() {
-    this.update();
-    this.render();
+    try {
+      this.update();
+      this.render();
+    } catch(e) {
+      // Keep loop alive — draw the error prominently
+      ctx.save();
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      ctx.fillStyle = 'rgba(0,0,0,0.85)';
+      ctx.fillRect(0, 0, BASE_W, 160);
+      ctx.fillStyle = '#ff4444';
+      ctx.font = 'bold 16px monospace';
+      ctx.textAlign = 'left';
+      ctx.fillText('ERROR (loop kept alive):', 10, 24);
+      ctx.fillStyle = '#ffffff';
+      ctx.font = '13px monospace';
+      // Wrap long messages
+      const msg = String(e && e.message ? e.message : e);
+      ctx.fillText(msg.substring(0, 100), 10, 48);
+      if (e && e.stack) {
+        const lines = e.stack.split('\n');
+        lines.slice(0, 5).forEach((ln, i) => {
+          ctx.fillText(ln.trim().substring(0, 110), 10, 70 + i * 18);
+        });
+      }
+      ctx.restore();
+      console.error('[LOOP ERROR]', e);
+    }
+
     this.input.update();
     requestAnimationFrame(() => this.loop());
   }
